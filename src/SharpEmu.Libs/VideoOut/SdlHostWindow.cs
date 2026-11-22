@@ -447,16 +447,20 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
                     UpdateCursorVisibility();
                     HostWindowInput.SetFocused(false);
                     break;
-                case SDL_EventType.SDL_EVENT_WINDOW_RESTORED:
                 case SDL_EventType.SDL_EVENT_WINDOW_RESIZED:
                 case SDL_EventType.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                    _surfaceRestorePending = true;
+                    break;
+                case SDL_EventType.SDL_EVENT_WINDOW_RESTORED:
                 case SDL_EventType.SDL_EVENT_WINDOW_MAXIMIZED:
                 case SDL_EventType.SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
                 case SDL_EventType.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
                 case SDL_EventType.SDL_EVENT_WINDOW_EXPOSED:
                 case SDL_EventType.SDL_EVENT_WINDOW_DISPLAY_CHANGED:
                 case SDL_EventType.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
-                    _surfaceRestorePending = true;
+                    // These repeat continuously with an unchanged drawable size.
+                    // RenderCore already recreates the swapchain when the actual
+                    // framebuffer extent changes, so ignore the state-only events.
                     break;
                 case SDL_EventType.SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
                     _hdrStateChangePending = true;
