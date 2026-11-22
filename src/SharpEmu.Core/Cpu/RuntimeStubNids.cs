@@ -8,4 +8,8 @@ internal static class RuntimeStubNids
     public const string BootstrapBridge = "__internal_bootstrap_bridge";
 
     public const string KernelDynlibDlsym = "__internal_kernel_dynlib_dlsym";
+
+    public const string Ps5CraftDlopen = "J-NVKVWfy+k";
+
+    public const string Ps5CraftDlsym = "JlnX1Lxy5zc";
 }

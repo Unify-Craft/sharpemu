@@ -21,6 +21,7 @@ public static class KernelModuleRegistry
     private static readonly Dictionary<int, ModuleEntry> _modulesByHandle = new();
     private static readonly Dictionary<int, Dictionary<string, ulong>> _symbolsByHandle = new();
     private static readonly Dictionary<int, ModuleSegment[]> _segmentsByHandle = new();
+    private static readonly Dictionary<int, IReadOnlyList<ulong>> _initializersByHandle = new();
     private static readonly Dictionary<string, int> _handleByPath = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, int> _handleByName = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<int, int> _sysmoduleHandleById = new();
@@ -65,6 +66,7 @@ public static class KernelModuleRegistry
             _modulesByHandle.Clear();
             _symbolsByHandle.Clear();
             _segmentsByHandle.Clear();
+            _initializersByHandle.Clear();
             _handleByPath.Clear();
             _handleByName.Clear();
             _sysmoduleHandleById.Clear();
@@ -260,6 +262,14 @@ public static class KernelModuleRegistry
         }
     }
 
+    public static IReadOnlyList<int> GetLoadedModuleHandles()
+    {
+        lock (_gate)
+        {
+            return _modulesByHandle.Keys.OrderBy(handle => handle).ToArray();
+        }
+    }
+
     public static bool TryGetModuleByHandle(int handle, out ModuleEntry module)
     {
         lock (_gate)
@@ -287,7 +297,9 @@ public static class KernelModuleRegistry
                 return false;
             }
 
-            if (module.InitEntryPoint < 0x10000)
+            var hasInitArray = _initializersByHandle.TryGetValue(handle, out var initializers) &&
+                               initializers.Count > 0;
+            if (module.InitEntryPoint < 0x10000 && !hasInitArray)
             {
                 module = module with { StartState = ModuleStartState.Started };
                 _modulesByHandle[handle] = module;
@@ -376,6 +388,26 @@ public static class KernelModuleRegistry
 
         segment = default;
         return false;
+    }
+
+    public static void RegisterModuleInitializers(int handle, IReadOnlyList<ulong> functions)
+    {
+        ArgumentNullException.ThrowIfNull(functions);
+        lock (_gate)
+        {
+            if (_modulesByHandle.ContainsKey(handle))
+            {
+                _initializersByHandle[handle] = functions.ToArray();
+            }
+        }
+    }
+
+    public static bool TryGetModuleInitializers(int handle, out IReadOnlyList<ulong> functions)
+    {
+        lock (_gate)
+        {
+            return _initializersByHandle.TryGetValue(handle, out functions!);
+        }
     }
 
     public static bool TryResolveModuleSymbol(int handle, string symbolName, out ulong address)

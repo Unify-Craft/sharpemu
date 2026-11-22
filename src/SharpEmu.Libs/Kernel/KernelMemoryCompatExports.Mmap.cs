@@ -19,7 +19,9 @@ public static partial class KernelMemoryCompatExports
         if (length == 0 || length > ulong.MaxValue - (OrbisPageSize - 1) ||
             (flags & 3) != 2 || (flags & 0x1000) == 0 || (flags & ~0xFF001012u) != 0 ||
             descriptor != -1 || offset != 0 || !TryDecodeMappedProtection(protection, out var mode))
+        {
             return PosixFailure(ctx, MemoryInvalidArgument, Einval);
+        }
         length = (length + OrbisPageSize - 1) & ~(OrbisPageSize - 1);
         var shift = flags >> 24;
         if (shift != 0 && shift is < 14 or > 31)
@@ -34,8 +36,7 @@ public static partial class KernelMemoryCompatExports
             lock (_memoryGate)
                 return MapFlexibleRangeLocked(ctx, requested, length, protection,
                     flags & ~0x1002u, alignment, mode, out address);
-        });
-        if (result != 0)
+        });        if (result != 0)
             return PosixFailure(ctx, result, result & 0xFFFF);
         ctx[CpuRegister.Rax] = address;
         return 0;

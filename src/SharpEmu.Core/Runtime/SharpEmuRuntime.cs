@@ -1006,6 +1006,29 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         }
 
         var normalizedGuestPath = guestModulePath.Replace('\\', '/');
+
+        // JNA extracts its native dispatch library into java.io.tmpdir and
+        // dlopen()s it from there. Those paths are outside app0 but are still
+        // within the emulator's mounted guest filesystems, so resolve them
+        // through the same sandbox-aware path mapper used by HLE file I/O.
+        if (!normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
+            !normalizedGuestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase) &&
+            !normalizedGuestPath.StartsWith("/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
+            !normalizedGuestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
+        {
+            var mountedPath = KernelMemoryCompatExports.ResolveGuestPath(normalizedGuestPath);
+            if (!string.IsNullOrWhiteSpace(mountedPath) && File.Exists(mountedPath))
+            {
+                modulePath = mountedPath;
+                return true;
+            }
+        }
+
         string relativePath;
         if (normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
         {
@@ -1340,6 +1363,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             isSystemModule);
         KernelModuleRegistry.RegisterModuleSymbols(handle, image.RuntimeSymbols);
         KernelModuleRegistry.RegisterModuleSegments(handle, ComputeImageSegments(image));
+        KernelModuleRegistry.RegisterModuleInitializers(
+            handle,
+            [.. image.PreInitializerFunctions, .. image.InitializerFunctions]);
         Console.Error.WriteLine(
             $"[RUNTIME] Registered module handle={handle} name={Path.GetFileName(modulePath)} base=0x{baseAddress:X16} size=0x{size:X16}");
         return handle;

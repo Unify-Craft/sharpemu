@@ -263,6 +263,17 @@ public static class KernelPthreadCompatExports
     public static int PosixPthreadSelf(CpuContext ctx) => PthreadSelf(ctx);
 
     [SysAbiExport(
+        Nid = "oxMp8uPqa+U",
+        ExportName = "pthread_set_name_np",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int PosixPthreadSetNameNp(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "3PtV6p3QNX4",
         ExportName = "scePthreadEqual",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -398,35 +409,63 @@ public static class KernelPthreadCompatExports
         ExportName = "pthread_mutex_init",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadMutexInit(CpuContext ctx) => PthreadMutexInitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi]);
+    public static int PosixPthreadMutexInit(CpuContext ctx) => MapPosixMutexResult(ctx,
+        PthreadMutexInitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi]));
 
     [SysAbiExport(
         Nid = "ltCfaGr2JGE",
         ExportName = "pthread_mutex_destroy",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadMutexDestroy(CpuContext ctx) => PthreadMutexDestroyCore(ctx, ctx[CpuRegister.Rdi]);
+    public static int PosixPthreadMutexDestroy(CpuContext ctx) => MapPosixMutexResult(ctx,
+        PthreadMutexDestroyCore(ctx, ctx[CpuRegister.Rdi]));
 
     [SysAbiExport(
         Nid = "7H0iTOciTLo",
         ExportName = "pthread_mutex_lock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadMutexLock(CpuContext ctx) => PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: false);
+    public static int PosixPthreadMutexLock(CpuContext ctx) => MapPosixMutexResult(ctx,
+        PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: false));
 
     [SysAbiExport(
         Nid = "K-jXhbt2gn4",
         ExportName = "pthread_mutex_trylock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadMutexTrylock(CpuContext ctx) => PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: true);
+    public static int PosixPthreadMutexTrylock(CpuContext ctx) => MapPosixMutexResult(ctx,
+        PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: true));
 
     [SysAbiExport(
         Nid = "2Z+PpY6CaJg",
         ExportName = "pthread_mutex_unlock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PosixPthreadMutexUnlock(CpuContext ctx) => PthreadMutexUnlockCore(ctx, ctx[CpuRegister.Rdi], requireOwner: true);
+    public static int PosixPthreadMutexUnlock(CpuContext ctx) => MapPosixMutexResult(ctx,
+        PthreadMutexUnlockCore(ctx, ctx[CpuRegister.Rdi], requireOwner: true));
+
+    private static int MapPosixMutexResult(CpuContext ctx, int result)
+    {
+        // POSIX pthread_mutex_* calls return an errno value directly. The HLE core
+        // speaks in ORBIS kernel result codes, so translate the cases HotSpot checks.
+        var mapped = result switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_OK => 0,
+            // HotSpot's BSD port compares against the FreeBSD errno values.
+            // ORBIS result codes are not errno values, so translate them to the
+            // same constants the prebuilt JVM expects (notably EBUSY == 16).
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY => 16,      // EBUSY
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK => 11,  // EDEADLK
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT => 60, // ETIMEDOUT
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => 22, // EINVAL
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND => 22, // EINVAL
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => 1, // EPERM
+            < 0 => 22,
+            _ => result,
+        };
+        ctx[CpuRegister.Rax] = unchecked((ulong)mapped);
+        return mapped;
+    }
 
     private static int PthreadGetthreadidCore(CpuContext ctx)
     {

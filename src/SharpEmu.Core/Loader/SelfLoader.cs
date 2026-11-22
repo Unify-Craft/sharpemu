@@ -33,6 +33,7 @@ public sealed class SelfLoader : ISelfLoader
     private const int ElfRelocationSize = 24;
     private const int ElfSectionHeaderSize = 64;
     private const uint SectionTypeSymbolTable = 2;
+    private const uint SectionTypeDynamicSymbolTable = 11;
     private const uint SectionTypeRela = 4;
 
     private const long DtNull = 0;
@@ -1312,6 +1313,7 @@ public sealed class SelfLoader : ISelfLoader
         var dynamicSymbols = RegisterDynamicRuntimeSymbols(
             imageData,
             loadContext,
+            elfHeader,
             programHeaders,
             virtualMemory,
             imageBase,
@@ -1501,7 +1503,7 @@ public sealed class SelfLoader : ISelfLoader
                 continue;
             }
 
-            if (sectionHeader.Type != SectionTypeSymbolTable ||
+            if (sectionHeader.Type is not (SectionTypeSymbolTable or SectionTypeDynamicSymbolTable) ||
                 sectionHeader.Size == 0 ||
                 sectionHeader.EntrySize < ElfSymbolSize ||
                 sectionHeader.Link >= elfHeader.SectionHeaderCount)
@@ -1529,7 +1531,7 @@ public sealed class SelfLoader : ISelfLoader
                 }
 
                 var symbol = ReadUnmanaged<ElfSymbol>(symbolBytes, 0);
-                if (symbol.Value == 0 || symbol.NameOffset == 0)
+                if (!IsDefinedExportSymbol(symbol) || symbol.NameOffset == 0)
                 {
                     continue;
                 }
@@ -1560,6 +1562,7 @@ public sealed class SelfLoader : ISelfLoader
     private static int RegisterDynamicRuntimeSymbols(
         ReadOnlySpan<byte> imageData,
         LoadContext loadContext,
+        ElfHeader elfHeader,
         IReadOnlyList<ProgramHeader> programHeaders,
         IVirtualMemory virtualMemory,
         ulong imageBase,
@@ -1606,7 +1609,15 @@ public sealed class SelfLoader : ISelfLoader
             return 0;
         }
 
-        ulong symTableSize = dynamicInfo.SymTabSize;
+        var symTableSize = dynamicInfo.SymTabSize;
+        if (symTableSize == 0)
+        {
+            symTableSize = TryResolveDynamicSymbolTableSize(
+                imageData,
+                loadContext,
+                elfHeader,
+                dynamicInfo.SymTabOffset);
+        }
         if (symTableSize == 0 || symTableSize > int.MaxValue)
         {
             return 0;
@@ -1629,7 +1640,7 @@ public sealed class SelfLoader : ISelfLoader
         for (uint symbolIndex = 0; symbolIndex < symbolCount; symbolIndex++)
         {
             if (!TryReadSymbol(symbolTable, symbolIndex, out var symbol) ||
-                symbol.Value == 0 ||
+                !IsDefinedExportSymbol(symbol) ||
                 symbol.NameOffset == 0 ||
                 !TryReadNullTerminatedAscii(stringTable, symbol.NameOffset, out var symbolName))
             {
@@ -1653,6 +1664,44 @@ public sealed class SelfLoader : ISelfLoader
         return added;
     }
 
+    private static ulong TryResolveDynamicSymbolTableSize(
+        ReadOnlySpan<byte> imageData,
+        LoadContext loadContext,
+        ElfHeader elfHeader,
+        ulong symTabAddress)
+    {
+        if (symTabAddress == 0 ||
+            elfHeader.SectionHeaderOffset == 0 ||
+            elfHeader.SectionHeaderCount == 0 ||
+            elfHeader.SectionHeaderEntrySize < ElfSectionHeaderSize)
+        {
+            return 0;
+        }
+
+        for (var sectionIndex = 0; sectionIndex < elfHeader.SectionHeaderCount; sectionIndex++)
+        {
+            if (!TryReadSectionHeader(imageData, loadContext, elfHeader, sectionIndex, out var sectionHeader) ||
+                sectionHeader.Type != SectionTypeDynamicSymbolTable ||
+                (sectionHeader.Address != symTabAddress && sectionHeader.Offset != symTabAddress))
+            {
+                continue;
+            }
+
+            return sectionHeader.Size;
+        }
+
+        return 0;
+    }
+
+    private static bool IsDefinedExportSymbol(ElfSymbol symbol)
+    {
+        // Some prebuilt JDK libraries place real exports at object offset zero.
+        // Undefined imports still use SHN_UNDEF; FILE/SECTION markers are not
+        // callable symbols even when they carry a zero value.
+        var symbolType = symbol.Info & 0x0F;
+        return symbol.SectionIndex != 0 && symbolType is not (3 or 4);
+    }
+
     private static bool RegisterRuntimeSymbol(
         IDictionary<string, ulong> runtimeSymbols,
         IDictionary<ulong, string> importStubs,
@@ -1664,31 +1713,47 @@ public sealed class SelfLoader : ISelfLoader
             return false;
         }
 
+        // ELF symbol versions are not part of dlsym lookup names. LWJGL exports
+        // JNI entry points as Java_...@@LWJGL, while the JVM asks for the plain
+        // Java_... name, so register both spellings.
+        var unversionedName = symbolName;
+        var versionIndex = unversionedName.IndexOf('@');
+        if (versionIndex > 0)
+        {
+            unversionedName = unversionedName[..versionIndex];
+        }
+
         var addedAny = false;
-        if (!runtimeSymbols.ContainsKey(symbolName))
+        if (!runtimeSymbols.ContainsKey(unversionedName))
+        {
+            runtimeSymbols[unversionedName] = symbolAddress;
+            addedAny = true;
+        }
+        if (!string.Equals(unversionedName, symbolName, StringComparison.Ordinal) &&
+            !runtimeSymbols.ContainsKey(symbolName))
         {
             runtimeSymbols[symbolName] = symbolAddress;
             addedAny = true;
         }
 
-        var nid = ExtractNid(symbolName);
+        var nid = ExtractNid(unversionedName);
         if (!string.IsNullOrWhiteSpace(nid) &&
-            !string.Equals(symbolName, nid, StringComparison.Ordinal) &&
+            !string.Equals(unversionedName, nid, StringComparison.Ordinal) &&
             !runtimeSymbols.ContainsKey(nid))
         {
             runtimeSymbols[nid] = symbolAddress;
             addedAny = true;
         }
 
-        if (symbolName.Length > 1 &&
-            symbolName[0] == '_' &&
-            !runtimeSymbols.ContainsKey(symbolName[1..]))
+        if (unversionedName.Length > 1 &&
+            unversionedName[0] == '_' &&
+            !runtimeSymbols.ContainsKey(unversionedName[1..]))
         {
-            runtimeSymbols[symbolName[1..]] = symbolAddress;
+            runtimeSymbols[unversionedName[1..]] = symbolAddress;
             addedAny = true;
         }
 
-        if (string.Equals(symbolName, "kernel_dynlib_dlsym", StringComparison.Ordinal))
+        if (string.Equals(unversionedName, "kernel_dynlib_dlsym", StringComparison.Ordinal))
         {
             importStubs[symbolAddress] = RuntimeStubNids.KernelDynlibDlsym;
         }
@@ -2363,17 +2428,14 @@ public sealed class SelfLoader : ISelfLoader
 
     private static ulong ResolveMappedAddressOrFallback(IVirtualMemory virtualMemory, ulong address, ulong imageBase)
     {
-        Console.Error.WriteLine($"[LOADER][TEST] ResolveMappedAddressOrFallback addr=0x{address:X} imageBase=0x{imageBase:X16}");
 
         if (address == 0)
         {
-            Console.Error.WriteLine("[LOADER][TEST] -> return 0 (null)");
             return 0;
         }
 
         if (TryResolveMappedAddress(virtualMemory, address, imageBase, 1, out var resolved))
         {
-            Console.Error.WriteLine($"[LOADER][TEST] -> resolved raw 0x{resolved:X16}");
             return resolved;
         }
 
@@ -2382,18 +2444,15 @@ public sealed class SelfLoader : ISelfLoader
             var rebased = address + imageBase;
             if (TryResolveMappedAddress(virtualMemory, rebased, imageBase, 1, out var resolvedRebased))
             {
-                Console.Error.WriteLine($"[LOADER][TEST] -> resolved rebased 0x{resolvedRebased:X16}");
                 return resolvedRebased;
             }
         }
 
         if (address < 0x10000)
         {
-            Console.Error.WriteLine($"[LOADER][TEST] -> reject small 0x{address:X}");
             return 0;
         }
 
-        Console.Error.WriteLine($"[LOADER][TEST] -> fallback raw 0x{address:X}");
         return address;
     }
 
@@ -2470,6 +2529,15 @@ public sealed class SelfLoader : ISelfLoader
         if (string.IsNullOrWhiteSpace(symbolName))
         {
             return string.Empty;
+        }
+
+        // ELF symbol versions are lookup metadata, not part of the import name.
+        // FreeBSD-ABI natives in the Java runtime import names such as
+        // environ@GLIBC_2.2.5; SharpEmu indexes HLE exports under "environ".
+        var version = symbolName.IndexOf('@');
+        if (version > 0)
+        {
+            symbolName = symbolName[..version];
         }
 
         var separator = symbolName.IndexOf('#');

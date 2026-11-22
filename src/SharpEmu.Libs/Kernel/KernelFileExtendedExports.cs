@@ -5,6 +5,8 @@ using SharpEmu.HLE;
 using SharpEmu.HLE.FileSystem;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Threading;
 
 namespace SharpEmu.Libs.Kernel;
@@ -34,6 +36,8 @@ public static partial class KernelMemoryCompatExports
 
     private static long _nextAioSubmitId = 1;
     private static readonly ConcurrentDictionary<uint, int> _aioResults = new();
+    private static ulong _qsortStackAddress;
+    private const ulong QsortStackSize = 0x40000;
 
     private static Stream? GetOpenFile(int fd)
     {
@@ -79,6 +83,81 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelPread(CpuContext ctx) => KernelPreadCore(ctx);
 
+    // Emulator-only helper used by the patched libjimage mmap wrapper. The
+    // prebuilt jimage library maps its modules image with raw FreeBSD syscalls;
+    // a plain malloc-backed stub gives it writable memory but leaves the class
+    // data uninitialized. This export allocates host-backed guest memory and
+    // fills it with a positional read from the original descriptor.
+#pragma warning disable SHEM006
+    [SysAbiExport(Nid = "dHeqeJdz8yY", ExportName = "ps5craft_mmap_file",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+#pragma warning restore SHEM006
+    public static int JimageMmapFile(CpuContext ctx)
+    {
+        var length = ctx[CpuRegister.Rsi];
+        var fd = unchecked((int)ctx[CpuRegister.R8]);
+        var offset = unchecked((long)ctx[CpuRegister.R9]);        if (length == 0 || length > int.MaxValue || offset < 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Stream? stream = null;
+        if (fd >= 0)
+        {
+            stream = GetOpenFile(fd);
+            if (stream is null)
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+        }
+
+        unsafe
+        {
+            var address = (ulong)HostMemory.Alloc(
+                null,
+                (nuint)length,
+                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
+                HostMemory.PAGE_READWRITE);
+            if (address == 0)
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED;
+            }
+
+            if (stream is not null)
+            {
+                // mmap zero-fills any part of the final page not covered by
+                // the file. HotSpot parses headers and padding from that tail,
+                // so an uninitialized buffer is not a valid mmap emulation.
+                var buffer = new byte[(int)length];
+                int read;
+                try
+                {
+                    read = ReadOpenFileAt(stream, buffer, offset);
+                }
+                catch (IOException)
+                {
+                    _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+                }
+
+                if (!TryWriteCompat(ctx, address, buffer))
+                {
+                    _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+            }
+            else if (!TryWriteCompat(ctx, address, new byte[(int)length]))
+            {
+                _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            ctx[CpuRegister.Rax] = address;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static int KernelPreadCore(CpuContext ctx)
     {
         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
@@ -120,6 +199,329 @@ public static partial class KernelMemoryCompatExports
 
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // jimage resolves ZIP_InflateFully from libzip. libzip uses raw FreeBSD
+    // syscalls and cannot be loaded by SharpEmu, so provide the same zlib-stream
+    // decompression through the managed runtime. Signature:
+    // jboolean ZIP_InflateFully(void* in, jlong inLen, void* out, jlong outLen,
+    //                           char** pmsg).
+#pragma warning disable SHEM006
+    [SysAbiExport(Nid = "0tRxq1I82CA", ExportName = "ZIP_InflateFully",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+#pragma warning restore SHEM006
+    public static int ZipInflateFully(CpuContext ctx)
+    {
+        var errorPointer = ctx[CpuRegister.R8];
+        if (errorPointer != 0)
+        {
+            _ = TryWriteUInt64Compat(ctx, errorPointer, 0);
+        }
+
+        var inputAddress = ctx[CpuRegister.Rdi];
+        var inputLength = ctx[CpuRegister.Rsi];
+        var outputAddress = ctx[CpuRegister.Rdx];
+        var outputLength = ctx[CpuRegister.Rcx];
+        if (inputAddress == 0 || outputAddress == 0 ||
+            inputLength == 0 || inputLength > int.MaxValue ||
+            outputLength == 0 || outputLength > int.MaxValue)
+        {
+            return 0;
+        }
+
+        var compressed = GC.AllocateUninitializedArray<byte>((int)inputLength);
+        if (!TryReadCompat(ctx, inputAddress, compressed))
+        {
+            return 0;
+        }
+
+        try
+        {
+            using var input = new MemoryStream(compressed, writable: false);
+            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
+            var output = GC.AllocateUninitializedArray<byte>((int)outputLength);
+            var total = 0;
+            while (total < output.Length)
+            {
+                var read = zlib.Read(output, total, output.Length - total);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                total += read;
+            }
+
+            // ZIP_InflateFully requires the stream to complete at the exact
+            // declared output size and rejects trailing compressed data.
+            var trailing = zlib.ReadByte();            if (total != output.Length || trailing != -1)
+            {
+                return 0;
+            }
+
+            return TryWriteCompat(ctx, outputAddress, output) ? 1 : 0;
+        }
+        catch (InvalidDataException)
+        {
+            return 0;
+        }
+    }
+
+    // HotSpot sorts VM metadata and InstanceKlass field tables with qsort.
+    // Leaving the import unresolved silently leaves those tables unsorted,
+    // which later breaks binary-search field lookups (for example
+    // java.lang.Class.classRedefinedCount). Invoke the guest comparator for
+    // each pair and keep guest memory coherent while Array.Sort reorders the
+    // managed copy.
+#pragma warning disable SHEM006
+    [SysAbiExport(Nid = "AEJdIVZTEmo", ExportName = "qsort",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libc")]
+#pragma warning restore SHEM006
+    public static int GuestQsort(CpuContext ctx)
+    {
+        var baseAddress = ctx[CpuRegister.Rdi];
+        var count = (int)Math.Min(ctx[CpuRegister.Rsi], int.MaxValue);
+        var elementSize = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+        var comparator = ctx[CpuRegister.Rcx];
+        if (count < 0 || elementSize <= 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+        if (count < 2 || baseAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        if (count > int.MaxValue / elementSize)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var elements = GC.AllocateUninitializedArray<byte>(count * elementSize);
+        if (!TryReadCompat(ctx, baseAddress, elements) ||
+            !TryWriteCompat(ctx, baseAddress, elements))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var failures = 0;
+        var scratch = GC.AllocateUninitializedArray<byte>(elementSize);
+        var comparatorVaddr = comparator >= 0x200_0000UL ? comparator - 0x200_0000UL : comparator;
+        int Compare(int left, int right)
+        {
+            var leftAddress = baseAddress + (ulong)(left * elementSize);
+            var rightAddress = baseAddress + (ulong)(right * elementSize);
+            if (!TryWriteCompat(ctx, leftAddress, elements.AsSpan(left * elementSize, elementSize)) ||
+                !TryWriteCompat(ctx, rightAddress, elements.AsSpan(right * elementSize, elementSize)))
+            {
+                failures++;
+                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
+            }
+
+            if (TryCompareKnownHotSpotComparator(ctx, comparatorVaddr, leftAddress, rightAddress, out var knownResult))
+            {
+                return knownResult;
+            }
+
+            var scheduler = GuestThreadExecution.Scheduler;
+            if (scheduler is null || comparator < 0x10000)
+            {
+                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
+            }
+
+            if (!scheduler.TryCallGuestFunction(
+                    ctx,
+                    comparator,
+                    leftAddress,
+                    rightAddress,
+                    0,
+                    0,
+                    0,
+                    "qsort",
+                    out var result,
+                    out var error))
+            {
+                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
+            }
+
+            return unchecked((int)(long)result);
+        }
+
+        void Swap(int left, int right)
+        {
+            if (left == right)
+            {
+                return;
+            }
+
+            var leftSpan = elements.AsSpan(left * elementSize, elementSize);
+            var rightSpan = elements.AsSpan(right * elementSize, elementSize);
+            leftSpan.CopyTo(scratch);
+            rightSpan.CopyTo(leftSpan);
+            scratch.CopyTo(rightSpan);
+            TryWriteCompat(ctx, baseAddress + (ulong)(left * elementSize), leftSpan);
+            TryWriteCompat(ctx, baseAddress + (ulong)(right * elementSize), rightSpan);
+        }
+
+        void SiftDown(int root, int end)
+        {
+            while (true)
+            {
+                var child = root * 2 + 1;
+                if (child >= end)
+                {
+                    return;
+                }
+                if (child + 1 < end && Compare(child, child + 1) < 0)
+                {
+                    child++;
+                }
+                if (Compare(root, child) >= 0)
+                {
+                    return;
+                }
+                Swap(root, child);
+                root = child;
+            }
+        }
+
+        // Heapsort keeps the guest array coherent after every swap. HotSpot's
+        // comparators dereference the element pointers in guest memory, so a
+        // managed permutation that only writes the final result is not enough.
+        for (var i = count / 2 - 1; i >= 0; i--)
+        {
+            SiftDown(i, count);
+        }
+        for (var end = count - 1; end > 0; end--)
+        {
+            Swap(0, end);
+            SiftDown(0, end);
+        }
+        if (!TryWriteCompat(ctx, baseAddress, elements))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static ulong EnsureQsortStack()
+    {
+        if (_qsortStackAddress != 0)
+        {
+            return _qsortStackAddress;
+        }
+
+        unsafe
+        {
+            var address = (ulong)HostMemory.Alloc(
+                null,
+                (nuint)QsortStackSize,
+                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
+                HostMemory.PAGE_READWRITE);
+            _qsortStackAddress = address;
+            return address;
+        }
+    }
+
+    private static bool TryCompareKnownHotSpotComparator(
+        CpuContext ctx,
+        ulong comparatorVaddr,
+        ulong leftAddress,
+        ulong rightAddress,
+        out int result)
+    {
+        result = 0;
+        switch (comparatorVaddr)
+        {
+            case 0xDE3060UL: // compare_vmsymbol_sid
+            {
+                if (!TryReadUInt32Compat(ctx, leftAddress, out var leftSid) ||
+                    !TryReadUInt32Compat(ctx, rightAddress, out var rightSid) ||
+                    !TryReadUInt64Compat(ctx, comparatorVaddr - 0xDE3060UL + 0x118E938UL, out var symbolTable))
+                {
+                    return false;
+                }
+                if (!TryReadUInt64Compat(ctx, symbolTable + leftSid * 8UL, out var leftSymbol) ||
+                    !TryReadUInt64Compat(ctx, symbolTable + rightSid * 8UL, out var rightSymbol))
+                {
+                    return false;
+                }
+                result = leftSymbol < rightSymbol ? -1 : leftSymbol > rightSymbol ? 1 : 0;
+                return true;
+            }
+            case 0x4BDB30UL: // LayoutRawBlock::compare_size_inverted
+            {
+                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftBlock) ||
+                    !TryReadUInt64Compat(ctx, rightAddress, out var rightBlock) ||
+                    !TryReadUInt32Compat(ctx, leftBlock + 0x1CUL, out var leftSize) ||
+                    !TryReadUInt32Compat(ctx, rightBlock + 0x1CUL, out var rightSize))
+                {
+                    return false;
+                }
+                var sizeDiff = unchecked((int)leftSize) - unchecked((int)rightSize);
+                if (sizeDiff != 0)
+                {
+                    result = sizeDiff;
+                    return true;
+                }
+                if (!TryReadUInt32Compat(ctx, rightBlock + 0x20UL, out var rightOffset) ||
+                    !TryReadUInt32Compat(ctx, leftBlock + 0x20UL, out var leftOffset))
+                {
+                    return false;
+                }
+                result = unchecked((int)rightOffset) - unchecked((int)leftOffset);
+                return true;
+            }
+            case 0x4BE9F0UL: // LayoutRawBlock::compare_offset
+            {
+                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftBlock) ||
+                    !TryReadUInt64Compat(ctx, rightAddress, out var rightBlock) ||
+                    !TryReadUInt32Compat(ctx, leftBlock + 0x14UL, out var leftOffset) ||
+                    !TryReadUInt32Compat(ctx, rightBlock + 0x14UL, out var rightOffset))
+                {
+                    return false;
+                }
+                result = unchecked((int)leftOffset) - unchecked((int)rightOffset);
+                return true;
+            }
+            case 0x4BD6B0UL: // FieldInfoStream search-table comparator
+            {
+                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftName) ||
+                    !TryReadUInt64Compat(ctx, rightAddress, out var rightName))
+                {
+                    return false;
+                }
+                if (leftName != rightName)
+                {
+                    result = leftName < rightName ? -1 : 1;
+                    return true;
+                }
+                if (!TryReadUInt64Compat(ctx, leftAddress + 8UL, out var leftSig) ||
+                    !TryReadUInt64Compat(ctx, rightAddress + 8UL, out var rightSig))
+                {
+                    return false;
+                }
+                result = leftSig < rightSig ? -1 : leftSig > rightSig ? 1 : 0;
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    private static int CompareBytes(byte[] left, int leftOffset, byte[] right, int rightOffset, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var diff = left[leftOffset + i].CompareTo(right[rightOffset + i]);
+            if (diff != 0)
+            {
+                return diff;
+            }
+        }
+        return 0;
     }
 
     [SysAbiExport(Nid = "C2kJ-byS5rM", ExportName = "pwrite",

@@ -1,681 +1,3051 @@
 diff --git a/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Imports.cs b/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Imports.cs
-index 4ee7181..42c7d31 100644
+index 42c7d31..71431fc 100644
 --- a/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Imports.cs
 +++ b/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Imports.cs
-@@ -2484,6 +2484,8 @@ public sealed partial class DirectExecutionBackend
- 		ulong outputAddress = cpuContext[CpuRegister.Rdx];
- 		if (!TryReadAsciiZ(symbolNameAddress, 512, out var symbolName))
+@@ -433,7 +433,11 @@ public sealed partial class DirectExecutionBackend
+ 		ulong num7 = *(ulong*)(argPackPtr + 96);
+ 		var probeTarget = _probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress;
+ 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
+-		if (!IsLikelyReturnAddress(num7))
++		// Low guest code addresses are valid for this title: libjvm is mapped at
++		// 0x02000000. The generic heuristic assumes Gen5 code lives at >=
++		// 0x300000000, so consult the guest's executable regions before treating
++		// such a return address as corrupt.
++		if (!IsLikelyReturnAddress(num7) && !IsDirectImportTargetUsable(num7))
  		{
-+			if (outputAddress != 0L)
-+				_ = TryWriteUInt64Compat(outputAddress, 0);
- 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
- 			return OrbisGen2Result.ORBIS_GEN2_OK;
- 		}
-@@ -2495,6 +2497,8 @@ public sealed partial class DirectExecutionBackend
+ 			for (int i = 1; i <= 4; i++)
+ 			{
+@@ -723,6 +727,14 @@ public sealed partial class DirectExecutionBackend
+ 				{
+ 					orbisGen2Result = DispatchKernelDynlibDlsym();
+ 				}
++				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.Ps5CraftDlopen, StringComparison.Ordinal))
++				{
++					orbisGen2Result = DispatchPs5CraftDlopen();
++				}
++				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.Ps5CraftDlsym, StringComparison.Ordinal))
++				{
++					orbisGen2Result = DispatchPs5CraftDlsym();
++				}
+ 				else if (string.Equals(importStubEntry.Nid, "r8mvOaWdi28", StringComparison.Ordinal))
+ 				{
+ 					orbisGen2Result = DispatchIl2CppApiLookupSymbol();
+@@ -2473,6 +2485,102 @@ public sealed partial class DirectExecutionBackend
+ 		return num;
+ 	}
+ 
++	private const ulong Ps5CraftGlobalDlopenHandle = 0x7F5C000000000001UL;
++
++	private OrbisGen2Result DispatchPs5CraftDlopen()
++	{
++		var cpuContext = ActiveCpuContext;
++		if (cpuContext == null)
++		{
++			return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++		}
++
++		var pathAddress = cpuContext[CpuRegister.Rdi];
++		if (pathAddress == 0)
++		{
++			// POSIX dlopen(NULL, ...) asks for a process-wide lookup handle.
++			cpuContext[CpuRegister.Rax] = Ps5CraftGlobalDlopenHandle;
++			return OrbisGen2Result.ORBIS_GEN2_OK;
++		}
++
++		if (!TryReadAsciiZ(pathAddress, 512, out var modulePath) ||
++			string.IsNullOrWhiteSpace(modulePath))
++		{
++			cpuContext[CpuRegister.Rax] = 0;
++			return OrbisGen2Result.ORBIS_GEN2_OK;
++		}
++
++		var savedRsi = cpuContext[CpuRegister.Rsi];
++		var savedRdx = cpuContext[CpuRegister.Rdx];
++		var savedRcx = cpuContext[CpuRegister.Rcx];
++		var savedR8 = cpuContext[CpuRegister.R8];
++		var savedR9 = cpuContext[CpuRegister.R9];
++		cpuContext[CpuRegister.Rsi] = 0;
++		cpuContext[CpuRegister.Rdx] = 0;
++		cpuContext[CpuRegister.Rcx] = 0;
++		cpuContext[CpuRegister.R8] = 0;
++		cpuContext[CpuRegister.R9] = 0;
++		var loadStatus = KernelRuntimeCompatExports.KernelLoadStartModule(cpuContext);
++		var handle = cpuContext[CpuRegister.Rax];
++		cpuContext[CpuRegister.Rsi] = savedRsi;
++		cpuContext[CpuRegister.Rdx] = savedRdx;
++		cpuContext[CpuRegister.Rcx] = savedRcx;
++		cpuContext[CpuRegister.R8] = savedR8;
++		cpuContext[CpuRegister.R9] = savedR9;
++
++		if (loadStatus != (int)OrbisGen2Result.ORBIS_GEN2_OK || handle == 0 || unchecked((long)handle) < 0)
++		{
++			handle = 0;
++		}
++		cpuContext[CpuRegister.Rax] = handle;
++		return OrbisGen2Result.ORBIS_GEN2_OK;
++	}
++
++	private OrbisGen2Result DispatchPs5CraftDlsym()
++	{
++		var cpuContext = ActiveCpuContext;
++		if (cpuContext == null)
++		{
++			return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++		}
++
++		var moduleHandleValue = cpuContext[CpuRegister.Rdi];
++		if (!TryReadAsciiZ(cpuContext[CpuRegister.Rsi], 512, out var symbolName) ||
++			string.IsNullOrWhiteSpace(symbolName))
++		{
++			cpuContext[CpuRegister.Rax] = 0;
++			return OrbisGen2Result.ORBIS_GEN2_OK;
++		}
++
++		ulong resolvedAddress = 0;
++		if (moduleHandleValue == 0 || moduleHandleValue == Ps5CraftGlobalDlopenHandle)
++		{
++			foreach (var candidateHandle in KernelModuleRegistry.GetLoadedModuleHandles())
++			{
++				if (TryResolveModuleSymbolAddress(candidateHandle, symbolName, out resolvedAddress))
++				{
++					break;
++				}
++			}
++			if (resolvedAddress == 0)
++			{
++				_ = TryResolveRuntimeSymbolAddress(symbolName, out resolvedAddress) ||
++					TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) ||
++					TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress);
++			}
++		}
++		else
++		{
++			var moduleHandle = unchecked((int)moduleHandleValue);
++			_ = TryResolveModuleSymbolAddress(moduleHandle, symbolName, out resolvedAddress) ||
++				TryResolveRuntimeSymbolAddress(symbolName, out resolvedAddress) ||
++				TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) ||
++				TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress);
++		}
++		cpuContext[CpuRegister.Rax] = resolvedAddress;
++		return OrbisGen2Result.ORBIS_GEN2_OK;
++	}
++
+ 	private OrbisGen2Result DispatchKernelDynlibDlsym()
+ 	{
+ 		var cpuContext = ActiveCpuContext;
+diff --git a/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs b/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs
+index 7986dc7..c2bb9b6 100644
+--- a/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs
++++ b/src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs
+@@ -1328,9 +1328,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
+ 		int num = 0;
+ 		int num2 = 0;
+ 		int num3 = 0;
+-		foreach (var (num4, text2) in importStubs)
++		foreach (var importStub in importStubs)
  		{
- 			Console.Error.WriteLine(
- 				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
-+			if (outputAddress != 0L)
-+				_ = TryWriteUInt64Compat(outputAddress, 0);
- 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
- 			return OrbisGen2Result.ORBIS_GEN2_OK;
++			var num4 = importStub.Key;
++			var text2 = importStub.Value;
+ 			_ = _moduleManager.TryGetExport(text2, out var resolvedExport);
++			if (resolvedExport is null &&
++				_moduleManager.TryGetExportByName(text2, out var namedExport))
++			{
++				// Some bundled JDK libraries still import plain FreeBSD names.
++				// Resolve them through the HLE export-name index and use the
++				// canonical NID for the rest of the import machinery.
++				resolvedExport = namedExport;
++				text2 = namedExport.Nid;
++			}
+ 			_importEntries[num] = new ImportStubEntry(
+ 				num4,
+ 				text2,
+@@ -1430,6 +1441,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
+ 				{
+ 					var (address, nid) = additionalStubs[i];
+ 					_ = _moduleManager.TryGetExport(nid, out var resolvedExport);
++					if (resolvedExport is null &&
++						_moduleManager.TryGetExportByName(nid, out var namedExport))
++					{
++						resolvedExport = namedExport;
++						nid = namedExport.Nid;
++					}
++
+ 					combinedEntries[currentEntries.Length + i] = new ImportStubEntry(
+ 						address,
+ 						nid,
+@@ -1783,7 +1801,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
+ 	{
+ 		targetAddress = 0uL;
+ 		resolvedSymbol = string.Empty;
+-		if (string.IsNullOrWhiteSpace(nid) || string.Equals(nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal))
++		if (string.IsNullOrWhiteSpace(nid) ||
++			string.Equals(nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal) ||
++			string.Equals(nid, RuntimeStubNids.Ps5CraftDlopen, StringComparison.Ordinal) ||
++			string.Equals(nid, RuntimeStubNids.Ps5CraftDlsym, StringComparison.Ordinal))
+ 		{
+ 			return false;
  		}
+diff --git a/src/SharpEmu.Core/Cpu/RuntimeStubNids.cs b/src/SharpEmu.Core/Cpu/RuntimeStubNids.cs
+index f07200a..3429046 100644
+--- a/src/SharpEmu.Core/Cpu/RuntimeStubNids.cs
++++ b/src/SharpEmu.Core/Cpu/RuntimeStubNids.cs
+@@ -8,4 +8,8 @@ internal static class RuntimeStubNids
+     public const string BootstrapBridge = "__internal_bootstrap_bridge";
+ 
+     public const string KernelDynlibDlsym = "__internal_kernel_dynlib_dlsym";
++
++    public const string Ps5CraftDlopen = "J-NVKVWfy+k";
++
++    public const string Ps5CraftDlsym = "JlnX1Lxy5zc";
+ }
+diff --git a/src/SharpEmu.Core/Loader/SelfLoader.cs b/src/SharpEmu.Core/Loader/SelfLoader.cs
+index 7276406..07634d8 100644
+--- a/src/SharpEmu.Core/Loader/SelfLoader.cs
++++ b/src/SharpEmu.Core/Loader/SelfLoader.cs
+@@ -33,6 +33,7 @@ public sealed class SelfLoader : ISelfLoader
+     private const int ElfRelocationSize = 24;
+     private const int ElfSectionHeaderSize = 64;
+     private const uint SectionTypeSymbolTable = 2;
++    private const uint SectionTypeDynamicSymbolTable = 11;
+     private const uint SectionTypeRela = 4;
+ 
+     private const long DtNull = 0;
+@@ -1312,6 +1313,7 @@ public sealed class SelfLoader : ISelfLoader
+         var dynamicSymbols = RegisterDynamicRuntimeSymbols(
+             imageData,
+             loadContext,
++            elfHeader,
+             programHeaders,
+             virtualMemory,
+             imageBase,
+@@ -1501,7 +1503,7 @@ public sealed class SelfLoader : ISelfLoader
+                 continue;
+             }
+ 
+-            if (sectionHeader.Type != SectionTypeSymbolTable ||
++            if (sectionHeader.Type is not (SectionTypeSymbolTable or SectionTypeDynamicSymbolTable) ||
+                 sectionHeader.Size == 0 ||
+                 sectionHeader.EntrySize < ElfSymbolSize ||
+                 sectionHeader.Link >= elfHeader.SectionHeaderCount)
+@@ -1529,7 +1531,7 @@ public sealed class SelfLoader : ISelfLoader
+                 }
+ 
+                 var symbol = ReadUnmanaged<ElfSymbol>(symbolBytes, 0);
+-                if (symbol.Value == 0 || symbol.NameOffset == 0)
++                if (!IsDefinedExportSymbol(symbol) || symbol.NameOffset == 0)
+                 {
+                     continue;
+                 }
+@@ -1560,6 +1562,7 @@ public sealed class SelfLoader : ISelfLoader
+     private static int RegisterDynamicRuntimeSymbols(
+         ReadOnlySpan<byte> imageData,
+         LoadContext loadContext,
++        ElfHeader elfHeader,
+         IReadOnlyList<ProgramHeader> programHeaders,
+         IVirtualMemory virtualMemory,
+         ulong imageBase,
+@@ -1606,7 +1609,15 @@ public sealed class SelfLoader : ISelfLoader
+             return 0;
+         }
+ 
+-        ulong symTableSize = dynamicInfo.SymTabSize;
++        var symTableSize = dynamicInfo.SymTabSize;
++        if (symTableSize == 0)
++        {
++            symTableSize = TryResolveDynamicSymbolTableSize(
++                imageData,
++                loadContext,
++                elfHeader,
++                dynamicInfo.SymTabOffset);
++        }
+         if (symTableSize == 0 || symTableSize > int.MaxValue)
+         {
+             return 0;
+@@ -1629,7 +1640,7 @@ public sealed class SelfLoader : ISelfLoader
+         for (uint symbolIndex = 0; symbolIndex < symbolCount; symbolIndex++)
+         {
+             if (!TryReadSymbol(symbolTable, symbolIndex, out var symbol) ||
+-                symbol.Value == 0 ||
++                !IsDefinedExportSymbol(symbol) ||
+                 symbol.NameOffset == 0 ||
+                 !TryReadNullTerminatedAscii(stringTable, symbol.NameOffset, out var symbolName))
+             {
+@@ -1653,6 +1664,44 @@ public sealed class SelfLoader : ISelfLoader
+         return added;
+     }
+ 
++    private static ulong TryResolveDynamicSymbolTableSize(
++        ReadOnlySpan<byte> imageData,
++        LoadContext loadContext,
++        ElfHeader elfHeader,
++        ulong symTabAddress)
++    {
++        if (symTabAddress == 0 ||
++            elfHeader.SectionHeaderOffset == 0 ||
++            elfHeader.SectionHeaderCount == 0 ||
++            elfHeader.SectionHeaderEntrySize < ElfSectionHeaderSize)
++        {
++            return 0;
++        }
++
++        for (var sectionIndex = 0; sectionIndex < elfHeader.SectionHeaderCount; sectionIndex++)
++        {
++            if (!TryReadSectionHeader(imageData, loadContext, elfHeader, sectionIndex, out var sectionHeader) ||
++                sectionHeader.Type != SectionTypeDynamicSymbolTable ||
++                (sectionHeader.Address != symTabAddress && sectionHeader.Offset != symTabAddress))
++            {
++                continue;
++            }
++
++            return sectionHeader.Size;
++        }
++
++        return 0;
++    }
++
++    private static bool IsDefinedExportSymbol(ElfSymbol symbol)
++    {
++        // Some prebuilt JDK libraries place real exports at object offset zero.
++        // Undefined imports still use SHN_UNDEF; FILE/SECTION markers are not
++        // callable symbols even when they carry a zero value.
++        var symbolType = symbol.Info & 0x0F;
++        return symbol.SectionIndex != 0 && symbolType is not (3 or 4);
++    }
++
+     private static bool RegisterRuntimeSymbol(
+         IDictionary<string, ulong> runtimeSymbols,
+         IDictionary<ulong, string> importStubs,
+@@ -1664,31 +1713,47 @@ public sealed class SelfLoader : ISelfLoader
+             return false;
+         }
+ 
++        // ELF symbol versions are not part of dlsym lookup names. LWJGL exports
++        // JNI entry points as Java_...@@LWJGL, while the JVM asks for the plain
++        // Java_... name, so register both spellings.
++        var unversionedName = symbolName;
++        var versionIndex = unversionedName.IndexOf('@');
++        if (versionIndex > 0)
++        {
++            unversionedName = unversionedName[..versionIndex];
++        }
++
+         var addedAny = false;
+-        if (!runtimeSymbols.ContainsKey(symbolName))
++        if (!runtimeSymbols.ContainsKey(unversionedName))
++        {
++            runtimeSymbols[unversionedName] = symbolAddress;
++            addedAny = true;
++        }
++        if (!string.Equals(unversionedName, symbolName, StringComparison.Ordinal) &&
++            !runtimeSymbols.ContainsKey(symbolName))
+         {
+             runtimeSymbols[symbolName] = symbolAddress;
+             addedAny = true;
+         }
+ 
+-        var nid = ExtractNid(symbolName);
++        var nid = ExtractNid(unversionedName);
+         if (!string.IsNullOrWhiteSpace(nid) &&
+-            !string.Equals(symbolName, nid, StringComparison.Ordinal) &&
++            !string.Equals(unversionedName, nid, StringComparison.Ordinal) &&
+             !runtimeSymbols.ContainsKey(nid))
+         {
+             runtimeSymbols[nid] = symbolAddress;
+             addedAny = true;
+         }
+ 
+-        if (symbolName.Length > 1 &&
+-            symbolName[0] == '_' &&
+-            !runtimeSymbols.ContainsKey(symbolName[1..]))
++        if (unversionedName.Length > 1 &&
++            unversionedName[0] == '_' &&
++            !runtimeSymbols.ContainsKey(unversionedName[1..]))
+         {
+-            runtimeSymbols[symbolName[1..]] = symbolAddress;
++            runtimeSymbols[unversionedName[1..]] = symbolAddress;
+             addedAny = true;
+         }
+ 
+-        if (string.Equals(symbolName, "kernel_dynlib_dlsym", StringComparison.Ordinal))
++        if (string.Equals(unversionedName, "kernel_dynlib_dlsym", StringComparison.Ordinal))
+         {
+             importStubs[symbolAddress] = RuntimeStubNids.KernelDynlibDlsym;
+         }
+@@ -2363,17 +2428,14 @@ public sealed class SelfLoader : ISelfLoader
+ 
+     private static ulong ResolveMappedAddressOrFallback(IVirtualMemory virtualMemory, ulong address, ulong imageBase)
+     {
+-        Console.Error.WriteLine($"[LOADER][TEST] ResolveMappedAddressOrFallback addr=0x{address:X} imageBase=0x{imageBase:X16}");
+ 
+         if (address == 0)
+         {
+-            Console.Error.WriteLine("[LOADER][TEST] -> return 0 (null)");
+             return 0;
+         }
+ 
+         if (TryResolveMappedAddress(virtualMemory, address, imageBase, 1, out var resolved))
+         {
+-            Console.Error.WriteLine($"[LOADER][TEST] -> resolved raw 0x{resolved:X16}");
+             return resolved;
+         }
+ 
+@@ -2382,18 +2444,15 @@ public sealed class SelfLoader : ISelfLoader
+             var rebased = address + imageBase;
+             if (TryResolveMappedAddress(virtualMemory, rebased, imageBase, 1, out var resolvedRebased))
+             {
+-                Console.Error.WriteLine($"[LOADER][TEST] -> resolved rebased 0x{resolvedRebased:X16}");
+                 return resolvedRebased;
+             }
+         }
+ 
+         if (address < 0x10000)
+         {
+-            Console.Error.WriteLine($"[LOADER][TEST] -> reject small 0x{address:X}");
+             return 0;
+         }
+ 
+-        Console.Error.WriteLine($"[LOADER][TEST] -> fallback raw 0x{address:X}");
+         return address;
+     }
+ 
+@@ -2472,6 +2531,15 @@ public sealed class SelfLoader : ISelfLoader
+             return string.Empty;
+         }
+ 
++        // ELF symbol versions are lookup metadata, not part of the import name.
++        // FreeBSD-ABI natives in the Java runtime import names such as
++        // environ@GLIBC_2.2.5; SharpEmu indexes HLE exports under "environ".
++        var version = symbolName.IndexOf('@');
++        if (version > 0)
++        {
++            symbolName = symbolName[..version];
++        }
++
+         var separator = symbolName.IndexOf('#');
+         return separator <= 0 ? symbolName : symbolName[..separator];
+     }
+diff --git a/src/SharpEmu.Core/Runtime/SharpEmuRuntime.cs b/src/SharpEmu.Core/Runtime/SharpEmuRuntime.cs
+index 5c0fc61..59778cb 100644
+--- a/src/SharpEmu.Core/Runtime/SharpEmuRuntime.cs
++++ b/src/SharpEmu.Core/Runtime/SharpEmuRuntime.cs
+@@ -1006,6 +1006,29 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
+         }
+ 
+         var normalizedGuestPath = guestModulePath.Replace('\\', '/');
++
++        // JNA extracts its native dispatch library into java.io.tmpdir and
++        // dlopen()s it from there. Those paths are outside app0 but are still
++        // within the emulator's mounted guest filesystems, so resolve them
++        // through the same sandbox-aware path mapper used by HLE file I/O.
++        if (!normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
++            !normalizedGuestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase) &&
++            !normalizedGuestPath.StartsWith("/", StringComparison.Ordinal))
++        {
++            return false;
++        }
++
++        if (!normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) &&
++            !normalizedGuestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
++        {
++            var mountedPath = KernelMemoryCompatExports.ResolveGuestPath(normalizedGuestPath);
++            if (!string.IsNullOrWhiteSpace(mountedPath) && File.Exists(mountedPath))
++            {
++                modulePath = mountedPath;
++                return true;
++            }
++        }
++
+         string relativePath;
+         if (normalizedGuestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
+         {
+@@ -1340,6 +1363,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
+             isSystemModule);
+         KernelModuleRegistry.RegisterModuleSymbols(handle, image.RuntimeSymbols);
+         KernelModuleRegistry.RegisterModuleSegments(handle, ComputeImageSegments(image));
++        KernelModuleRegistry.RegisterModuleInitializers(
++            handle,
++            [.. image.PreInitializerFunctions, .. image.InitializerFunctions]);
+         Console.Error.WriteLine(
+             $"[RUNTIME] Registered module handle={handle} name={Path.GetFileName(modulePath)} base=0x{baseAddress:X16} size=0x{size:X16}");
+         return handle;
+diff --git a/src/SharpEmu.HLE/HleDataSymbols.cs b/src/SharpEmu.HLE/HleDataSymbols.cs
+index 7f94041..9405d70 100644
+--- a/src/SharpEmu.HLE/HleDataSymbols.cs
++++ b/src/SharpEmu.HLE/HleDataSymbols.cs
+@@ -12,6 +12,11 @@ public static class HleDataSymbols
+     private const string ProgNameNid = "djxxOmW6-aw";
+     private const string LibcNeedFlagNid = "P330P3dFF68";
+     private const string LibcInternalNeedFlagNid = "ZT4ODD2Ts9o";
++    private const string EnvironNid = "+2thxYZ4syk";
++    private const string StdinPointerNid = "bgAcsbcEznc";
++    private const string StdoutPointerNid = "zqJhBxAKfsc";
++    private const string StderrPointerNid = "as8Od-tH1BI";
++    private const string IsThreadedNid = "q1OvUam0BJU";
+     private const int ProgNameMaxBytes = 511;
+     // Terminator canaries reserve the low byte as NUL. Keep the process data
+     // symbol and every per-thread TLS copy byte-for-byte identical.
+@@ -24,6 +29,12 @@ public static class HleDataSymbols
+     private static readonly nint _argumentVectorAddress = Allocate(nint.Size * 2);
+     private static readonly nint _libcNeedFlagAddress = Allocate(sizeof(uint));
+     private static readonly nint _libcInternalNeedFlagAddress = Allocate(sizeof(uint));
++    private static readonly nint _environVectorAddress = Allocate(nint.Size * 5);
++    private static readonly nint _environVariableAddress = Allocate(nint.Size);
++    private static readonly nint _stdinPointerAddress = Allocate(nint.Size);
++    private static readonly nint _stdoutPointerAddress = Allocate(nint.Size);
++    private static readonly nint _stderrPointerAddress = Allocate(nint.Size);
++    private static readonly nint _isThreadedAddress = Allocate(sizeof(int));
+     private static int _processArgumentCount;
+     private static ulong _processArgumentVector;
+ 
+@@ -47,6 +58,8 @@ public static class HleDataSymbols
+             Marshal.WriteInt32(_libcInternalNeedFlagAddress, 1);
+         }
+ 
++        ConfigureEnviron();
++        ConfigureStdio();
+         ConfigureProcessImageName("eboot.bin");
+     }
+ 
+@@ -56,6 +69,19 @@ public static class HleDataSymbols
+         yield return ProgNameNid;
+         yield return LibcNeedFlagNid;
+         yield return LibcInternalNeedFlagNid;
++        yield return EnvironNid;
++        yield return StdinPointerNid;
++        yield return StdoutPointerNid;
++        yield return StderrPointerNid;
++        yield return IsThreadedNid;
++        // Libraries that were not passed through the NID rewriter still import
++        // these data symbols by their plain FreeBSD names.
++        yield return "__stack_chk_guard";
++        yield return "__stderrp";
++        // libSDL3 and other FreeBSD-ABI natives import environ with an ELF
++        // version suffix. SelfLoader strips the suffix before data rebinding.
++        yield return "environ";
++        yield return "__environ";
+     }
+ 
+     public static int ProcessArgumentCount =>
+@@ -107,6 +133,56 @@ public static class HleDataSymbols
+         }
+     }
+ 
++    private static void ConfigureEnviron()
++    {
++        if (_environVectorAddress == 0 || _environVariableAddress == 0)
++        {
++            return;
++        }
++
++        string[] values =
++        [
++            "PS5CRAFT=1",
++            "HOME=/app0",
++            "TMPDIR=/tmp",
++            "PATH=/app0/assets/java25/bin",
++        ];
++
++        for (var i = 0; i < values.Length; i++)
++        {
++            var valueAddress = Allocate(values[i].Length + 1);
++            if (valueAddress == 0)
++            {
++                continue;
++            }
++
++            var encoded = Encoding.UTF8.GetBytes(values[i]);
++            Marshal.Copy(encoded, 0, valueAddress, encoded.Length);
++            Marshal.WriteByte(valueAddress, encoded.Length, 0);
++            WritePointer(IntPtr.Add(_environVectorAddress, i * nint.Size), valueAddress);
++        }
++
++        WritePointer(IntPtr.Add(_environVectorAddress, values.Length * nint.Size), 0);
++        WritePointer(_environVariableAddress, _environVectorAddress);
++    }
++
++    private static void ConfigureStdio()
++    {
++        if (_stdinPointerAddress == 0 || _stdoutPointerAddress == 0 ||
++            _stderrPointerAddress == 0 || _isThreadedAddress == 0)
++        {
++            return;
++        }
++
++        // HLE stdio treats unknown stream pointers as the host console. Give
++        // each standard FILE symbol a non-zero opaque object so caller-side
++        // NULL checks and FILE* comparisons behave like a normal libc.
++        WritePointer(_stdinPointerAddress, Allocate(64));
++        WritePointer(_stdoutPointerAddress, Allocate(64));
++        WritePointer(_stderrPointerAddress, Allocate(64));
++        Marshal.WriteInt32(_isThreadedAddress, 1);
++    }
++
+     public static bool TryGetAddress(string nid, out ulong address)
+     {
+         var pointer = nid switch
+@@ -115,6 +191,15 @@ public static class HleDataSymbols
+             ProgNameNid => _progNamePointerAddress,
+             LibcNeedFlagNid => _libcNeedFlagAddress,
+             LibcInternalNeedFlagNid => _libcInternalNeedFlagAddress,
++            EnvironNid => _environVariableAddress,
++            StdinPointerNid => _stdinPointerAddress,
++            StdoutPointerNid => _stdoutPointerAddress,
++            StderrPointerNid => _stderrPointerAddress,
++            IsThreadedNid => _isThreadedAddress,
++            "__stack_chk_guard" => _stackChkGuardAddress,
++            "__stderrp" => _stderrPointerAddress,
++            "environ" => _environVariableAddress,
++            "__environ" => _environVariableAddress,
+             _ => 0,
+         };
+ 
 diff --git a/src/SharpEmu.Libs/Kernel/KernelFileExtendedExports.cs b/src/SharpEmu.Libs/Kernel/KernelFileExtendedExports.cs
-index 4fa781b..cb5d933 100644
+index cb5d933..4632b23 100644
 --- a/src/SharpEmu.Libs/Kernel/KernelFileExtendedExports.cs
 +++ b/src/SharpEmu.Libs/Kernel/KernelFileExtendedExports.cs
-@@ -113,7 +113,7 @@ public static partial class KernelMemoryCompatExports
-             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
-         }
+@@ -5,6 +5,8 @@ using SharpEmu.HLE;
+ using SharpEmu.HLE.FileSystem;
+ using System.Buffers.Binary;
+ using System.Collections.Concurrent;
++using System.IO.Compression;
++using System.Security.Cryptography;
+ using System.Threading;
  
--        if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
-+        if (read > 0 && !TryWriteCompat(ctx, bufferAddress, buffer.AsSpan(0, read)))
-         {
-             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-         }
-@@ -154,7 +154,7 @@ public static partial class KernelMemoryCompatExports
-         }
+ namespace SharpEmu.Libs.Kernel;
+@@ -34,6 +36,8 @@ public static partial class KernelMemoryCompatExports
  
-         var payload = GC.AllocateUninitializedArray<byte>(requested);
--        if (!ctx.Memory.TryRead(bufferAddress, payload))
-+        if (!TryReadCompat(ctx, bufferAddress, payload))
-         {
-             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-         }
+     private static long _nextAioSubmitId = 1;
+     private static readonly ConcurrentDictionary<uint, int> _aioResults = new();
++    private static ulong _qsortStackAddress;
++    private const ulong QsortStackSize = 0x40000;
+ 
+     private static Stream? GetOpenFile(int fd)
+     {
+@@ -79,6 +83,81 @@ public static partial class KernelMemoryCompatExports
+         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+     public static int KernelPread(CpuContext ctx) => KernelPreadCore(ctx);
+ 
++    // Emulator-only helper used by the patched libjimage mmap wrapper. The
++    // prebuilt jimage library maps its modules image with raw FreeBSD syscalls;
++    // a plain malloc-backed stub gives it writable memory but leaves the class
++    // data uninitialized. This export allocates host-backed guest memory and
++    // fills it with a positional read from the original descriptor.
++#pragma warning disable SHEM006
++    [SysAbiExport(Nid = "dHeqeJdz8yY", ExportName = "ps5craft_mmap_file",
++        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
++#pragma warning restore SHEM006
++    public static int JimageMmapFile(CpuContext ctx)
++    {
++        var length = ctx[CpuRegister.Rsi];
++        var fd = unchecked((int)ctx[CpuRegister.R8]);
++        var offset = unchecked((long)ctx[CpuRegister.R9]);        if (length == 0 || length > int.MaxValue || offset < 0)
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++        }
++
++        Stream? stream = null;
++        if (fd >= 0)
++        {
++            stream = GetOpenFile(fd);
++            if (stream is null)
++            {
++                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
++            }
++        }
++
++        unsafe
++        {
++            var address = (ulong)HostMemory.Alloc(
++                null,
++                (nuint)length,
++                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
++                HostMemory.PAGE_READWRITE);
++            if (address == 0)
++            {
++                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED;
++            }
++
++            if (stream is not null)
++            {
++                // mmap zero-fills any part of the final page not covered by
++                // the file. HotSpot parses headers and padding from that tail,
++                // so an uninitialized buffer is not a valid mmap emulation.
++                var buffer = new byte[(int)length];
++                int read;
++                try
++                {
++                    read = ReadOpenFileAt(stream, buffer, offset);
++                }
++                catch (IOException)
++                {
++                    _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
++                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++                }
++
++                if (!TryWriteCompat(ctx, address, buffer))
++                {
++                    _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
++                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++                }
++            }
++            else if (!TryWriteCompat(ctx, address, new byte[(int)length]))
++            {
++                _ = HostMemory.Free((void*)address, (nuint)length, HostMemory.MEM_RELEASE);
++                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++            }
++
++            ctx[CpuRegister.Rax] = address;
++        }
++
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
+     private static int KernelPreadCore(CpuContext ctx)
+     {
+         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+@@ -122,6 +201,329 @@ public static partial class KernelMemoryCompatExports
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+ 
++    // jimage resolves ZIP_InflateFully from libzip. libzip uses raw FreeBSD
++    // syscalls and cannot be loaded by SharpEmu, so provide the same zlib-stream
++    // decompression through the managed runtime. Signature:
++    // jboolean ZIP_InflateFully(void* in, jlong inLen, void* out, jlong outLen,
++    //                           char** pmsg).
++#pragma warning disable SHEM006
++    [SysAbiExport(Nid = "0tRxq1I82CA", ExportName = "ZIP_InflateFully",
++        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
++#pragma warning restore SHEM006
++    public static int ZipInflateFully(CpuContext ctx)
++    {
++        var errorPointer = ctx[CpuRegister.R8];
++        if (errorPointer != 0)
++        {
++            _ = TryWriteUInt64Compat(ctx, errorPointer, 0);
++        }
++
++        var inputAddress = ctx[CpuRegister.Rdi];
++        var inputLength = ctx[CpuRegister.Rsi];
++        var outputAddress = ctx[CpuRegister.Rdx];
++        var outputLength = ctx[CpuRegister.Rcx];
++        if (inputAddress == 0 || outputAddress == 0 ||
++            inputLength == 0 || inputLength > int.MaxValue ||
++            outputLength == 0 || outputLength > int.MaxValue)
++        {
++            return 0;
++        }
++
++        var compressed = GC.AllocateUninitializedArray<byte>((int)inputLength);
++        if (!TryReadCompat(ctx, inputAddress, compressed))
++        {
++            return 0;
++        }
++
++        try
++        {
++            using var input = new MemoryStream(compressed, writable: false);
++            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
++            var output = GC.AllocateUninitializedArray<byte>((int)outputLength);
++            var total = 0;
++            while (total < output.Length)
++            {
++                var read = zlib.Read(output, total, output.Length - total);
++                if (read == 0)
++                {
++                    break;
++                }
++
++                total += read;
++            }
++
++            // ZIP_InflateFully requires the stream to complete at the exact
++            // declared output size and rejects trailing compressed data.
++            var trailing = zlib.ReadByte();            if (total != output.Length || trailing != -1)
++            {
++                return 0;
++            }
++
++            return TryWriteCompat(ctx, outputAddress, output) ? 1 : 0;
++        }
++        catch (InvalidDataException)
++        {
++            return 0;
++        }
++    }
++
++    // HotSpot sorts VM metadata and InstanceKlass field tables with qsort.
++    // Leaving the import unresolved silently leaves those tables unsorted,
++    // which later breaks binary-search field lookups (for example
++    // java.lang.Class.classRedefinedCount). Invoke the guest comparator for
++    // each pair and keep guest memory coherent while Array.Sort reorders the
++    // managed copy.
++#pragma warning disable SHEM006
++    [SysAbiExport(Nid = "AEJdIVZTEmo", ExportName = "qsort",
++        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libc")]
++#pragma warning restore SHEM006
++    public static int GuestQsort(CpuContext ctx)
++    {
++        var baseAddress = ctx[CpuRegister.Rdi];
++        var count = (int)Math.Min(ctx[CpuRegister.Rsi], int.MaxValue);
++        var elementSize = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
++        var comparator = ctx[CpuRegister.Rcx];
++        if (count < 0 || elementSize <= 0)
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++        }
++        if (count < 2 || baseAddress == 0)
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++        if (count > int.MaxValue / elementSize)
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++        }
++
++        var elements = GC.AllocateUninitializedArray<byte>(count * elementSize);
++        if (!TryReadCompat(ctx, baseAddress, elements) ||
++            !TryWriteCompat(ctx, baseAddress, elements))
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++        }
++
++        var failures = 0;
++        var scratch = GC.AllocateUninitializedArray<byte>(elementSize);
++        var comparatorVaddr = comparator >= 0x200_0000UL ? comparator - 0x200_0000UL : comparator;
++        int Compare(int left, int right)
++        {
++            var leftAddress = baseAddress + (ulong)(left * elementSize);
++            var rightAddress = baseAddress + (ulong)(right * elementSize);
++            if (!TryWriteCompat(ctx, leftAddress, elements.AsSpan(left * elementSize, elementSize)) ||
++                !TryWriteCompat(ctx, rightAddress, elements.AsSpan(right * elementSize, elementSize)))
++            {
++                failures++;
++                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
++            }
++
++            if (TryCompareKnownHotSpotComparator(ctx, comparatorVaddr, leftAddress, rightAddress, out var knownResult))
++            {
++                return knownResult;
++            }
++
++            var scheduler = GuestThreadExecution.Scheduler;
++            if (scheduler is null || comparator < 0x10000)
++            {
++                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
++            }
++
++            if (!scheduler.TryCallGuestFunction(
++                    ctx,
++                    comparator,
++                    leftAddress,
++                    rightAddress,
++                    0,
++                    0,
++                    0,
++                    "qsort",
++                    out var result,
++                    out var error))
++            {
++                return CompareBytes(elements, left * elementSize, elements, right * elementSize, elementSize);
++            }
++
++            return unchecked((int)(long)result);
++        }
++
++        void Swap(int left, int right)
++        {
++            if (left == right)
++            {
++                return;
++            }
++
++            var leftSpan = elements.AsSpan(left * elementSize, elementSize);
++            var rightSpan = elements.AsSpan(right * elementSize, elementSize);
++            leftSpan.CopyTo(scratch);
++            rightSpan.CopyTo(leftSpan);
++            scratch.CopyTo(rightSpan);
++            TryWriteCompat(ctx, baseAddress + (ulong)(left * elementSize), leftSpan);
++            TryWriteCompat(ctx, baseAddress + (ulong)(right * elementSize), rightSpan);
++        }
++
++        void SiftDown(int root, int end)
++        {
++            while (true)
++            {
++                var child = root * 2 + 1;
++                if (child >= end)
++                {
++                    return;
++                }
++                if (child + 1 < end && Compare(child, child + 1) < 0)
++                {
++                    child++;
++                }
++                if (Compare(root, child) >= 0)
++                {
++                    return;
++                }
++                Swap(root, child);
++                root = child;
++            }
++        }
++
++        // Heapsort keeps the guest array coherent after every swap. HotSpot's
++        // comparators dereference the element pointers in guest memory, so a
++        // managed permutation that only writes the final result is not enough.
++        for (var i = count / 2 - 1; i >= 0; i--)
++        {
++            SiftDown(i, count);
++        }
++        for (var end = count - 1; end > 0; end--)
++        {
++            Swap(0, end);
++            SiftDown(0, end);
++        }
++        if (!TryWriteCompat(ctx, baseAddress, elements))
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    private static ulong EnsureQsortStack()
++    {
++        if (_qsortStackAddress != 0)
++        {
++            return _qsortStackAddress;
++        }
++
++        unsafe
++        {
++            var address = (ulong)HostMemory.Alloc(
++                null,
++                (nuint)QsortStackSize,
++                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
++                HostMemory.PAGE_READWRITE);
++            _qsortStackAddress = address;
++            return address;
++        }
++    }
++
++    private static bool TryCompareKnownHotSpotComparator(
++        CpuContext ctx,
++        ulong comparatorVaddr,
++        ulong leftAddress,
++        ulong rightAddress,
++        out int result)
++    {
++        result = 0;
++        switch (comparatorVaddr)
++        {
++            case 0xDE3060UL: // compare_vmsymbol_sid
++            {
++                if (!TryReadUInt32Compat(ctx, leftAddress, out var leftSid) ||
++                    !TryReadUInt32Compat(ctx, rightAddress, out var rightSid) ||
++                    !TryReadUInt64Compat(ctx, comparatorVaddr - 0xDE3060UL + 0x118E938UL, out var symbolTable))
++                {
++                    return false;
++                }
++                if (!TryReadUInt64Compat(ctx, symbolTable + leftSid * 8UL, out var leftSymbol) ||
++                    !TryReadUInt64Compat(ctx, symbolTable + rightSid * 8UL, out var rightSymbol))
++                {
++                    return false;
++                }
++                result = leftSymbol < rightSymbol ? -1 : leftSymbol > rightSymbol ? 1 : 0;
++                return true;
++            }
++            case 0x4BDB30UL: // LayoutRawBlock::compare_size_inverted
++            {
++                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftBlock) ||
++                    !TryReadUInt64Compat(ctx, rightAddress, out var rightBlock) ||
++                    !TryReadUInt32Compat(ctx, leftBlock + 0x1CUL, out var leftSize) ||
++                    !TryReadUInt32Compat(ctx, rightBlock + 0x1CUL, out var rightSize))
++                {
++                    return false;
++                }
++                var sizeDiff = unchecked((int)leftSize) - unchecked((int)rightSize);
++                if (sizeDiff != 0)
++                {
++                    result = sizeDiff;
++                    return true;
++                }
++                if (!TryReadUInt32Compat(ctx, rightBlock + 0x20UL, out var rightOffset) ||
++                    !TryReadUInt32Compat(ctx, leftBlock + 0x20UL, out var leftOffset))
++                {
++                    return false;
++                }
++                result = unchecked((int)rightOffset) - unchecked((int)leftOffset);
++                return true;
++            }
++            case 0x4BE9F0UL: // LayoutRawBlock::compare_offset
++            {
++                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftBlock) ||
++                    !TryReadUInt64Compat(ctx, rightAddress, out var rightBlock) ||
++                    !TryReadUInt32Compat(ctx, leftBlock + 0x14UL, out var leftOffset) ||
++                    !TryReadUInt32Compat(ctx, rightBlock + 0x14UL, out var rightOffset))
++                {
++                    return false;
++                }
++                result = unchecked((int)leftOffset) - unchecked((int)rightOffset);
++                return true;
++            }
++            case 0x4BD6B0UL: // FieldInfoStream search-table comparator
++            {
++                if (!TryReadUInt64Compat(ctx, leftAddress, out var leftName) ||
++                    !TryReadUInt64Compat(ctx, rightAddress, out var rightName))
++                {
++                    return false;
++                }
++                if (leftName != rightName)
++                {
++                    result = leftName < rightName ? -1 : 1;
++                    return true;
++                }
++                if (!TryReadUInt64Compat(ctx, leftAddress + 8UL, out var leftSig) ||
++                    !TryReadUInt64Compat(ctx, rightAddress + 8UL, out var rightSig))
++                {
++                    return false;
++                }
++                result = leftSig < rightSig ? -1 : leftSig > rightSig ? 1 : 0;
++                return true;
++            }
++            default:
++                return false;
++        }
++    }
++
++    private static int CompareBytes(byte[] left, int leftOffset, byte[] right, int rightOffset, int count)
++    {
++        for (var i = 0; i < count; i++)
++        {
++            var diff = left[leftOffset + i].CompareTo(right[rightOffset + i]);
++            if (diff != 0)
++            {
++                return diff;
++            }
++        }
++        return 0;
++    }
++
+     [SysAbiExport(Nid = "C2kJ-byS5rM", ExportName = "pwrite",
+         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+     public static int PosixPwrite(CpuContext ctx) => KernelPwriteCore(ctx);
+diff --git a/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.Mmap.cs b/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.Mmap.cs
+index 139dbc3..39a5a42 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.Mmap.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.Mmap.cs
+@@ -19,7 +19,9 @@ public static partial class KernelMemoryCompatExports
+         if (length == 0 || length > ulong.MaxValue - (OrbisPageSize - 1) ||
+             (flags & 3) != 2 || (flags & 0x1000) == 0 || (flags & ~0xFF001012u) != 0 ||
+             descriptor != -1 || offset != 0 || !TryDecodeMappedProtection(protection, out var mode))
++        {
+             return PosixFailure(ctx, MemoryInvalidArgument, Einval);
++        }
+         length = (length + OrbisPageSize - 1) & ~(OrbisPageSize - 1);
+         var shift = flags >> 24;
+         if (shift != 0 && shift is < 14 or > 31)
+@@ -34,8 +36,7 @@ public static partial class KernelMemoryCompatExports
+             lock (_memoryGate)
+                 return MapFlexibleRangeLocked(ctx, requested, length, protection,
+                     flags & ~0x1002u, alignment, mode, out address);
+-        });
+-        if (result != 0)
++        });        if (result != 0)
+             return PosixFailure(ctx, result, result & 0xFFFF);
+         ctx[CpuRegister.Rax] = address;
+         return 0;
 diff --git a/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs
-index caaf65c..d023538 100644
+index d023538..16be568 100644
 --- a/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs
 +++ b/src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs
-@@ -100,11 +100,14 @@ public static partial class KernelMemoryCompatExports
+@@ -69,6 +69,7 @@ public static partial class KernelMemoryCompatExports
+     private const uint HostPageExecuteWriteCopy = 0x80;
+     private const uint HostPageGuard = 0x100;
+     private const int Enoent = 2;
++    private const int Enotdir = 62;
+     private const int Ebadf = 9;
+     private const int Enomem = 12;
+     private const int Eacces = 13;
+@@ -77,6 +78,8 @@ public static partial class KernelMemoryCompatExports
+     private const int Erange = 34;
+     private const int Struncate = 80;
+     private const nuint DefaultLibcHeapAlignment = 16;
++    private const nuint LargeLibcHeapAlignment = 0x4000;
++    private const ulong LargeLibcHeapThreshold = 0x4000;
+     private const ushort KernelStatModeDirectory = 0x41FF;
+     private const ushort KernelStatModeRegular = 0x81FF;
+     private const int KernelStatSize = 120;
+@@ -99,9 +102,7 @@ public static partial class KernelMemoryCompatExports
+     private const int KernelStatStBirthtimOffset = 104;
  
      private static readonly object _fdGate = new();
-     private static readonly Dictionary<int, Stream> _openFiles = new();
-+    private static int _vmTraceFd = -1;
-     private static readonly HashSet<int> _randomDeviceDescriptors = new();
+-    private static readonly Dictionary<int, Stream> _openFiles = new();
+-    private static int _vmTraceFd = -1;
+-    private static readonly HashSet<int> _randomDeviceDescriptors = new();
++    private static readonly Dictionary<int, Stream> _openFiles = new();    private static readonly HashSet<int> _randomDeviceDescriptors = new();
      private static readonly Dictionary<int, HostMovieBridge.BinkGuestCompletionShim>
          _binkGuestCompletionShims = new();
      private static readonly Dictionary<int, string> _observedBinkGuestFiles = new();
-     private static readonly Dictionary<int, OpenDirectory> _openDirectories = new();
-+    private static readonly HashSet<ulong> _posixDirectoryHandles = new();
-+    private static long _nextPosixDirectoryHandle;
-     private static readonly object _libcAllocGate = new();
-     private static readonly object _memoryGate = new();
-     private static readonly object _ioTraceGate = new();
-@@ -1454,6 +1457,19 @@ public static partial class KernelMemoryCompatExports
-             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-         }
+@@ -215,7 +216,12 @@ public static partial class KernelMemoryCompatExports
+         public int NextIndex { get; set; }
+     }
  
-+        if (string.Equals(guestPath, "/download0/java25-vm-trace.log", StringComparison.Ordinal) &&
-+            IsMutatingOpen(flags))
-+        {
-+            var traceFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
-+            lock (_fdGate)
-+            {
-+                _openFiles[traceFd] = new MemoryStream();
-+                _vmTraceFd = traceFd;
-+            }
-+            ctx[CpuRegister.Rax] = unchecked((ulong)traceFd);
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
-         if (IsRandomDevicePath(guestPath) && (flags & O_DIRECTORY) == 0)
-         {
-             var randomFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
-@@ -1695,6 +1711,85 @@ public static partial class KernelMemoryCompatExports
-         return -1;
+-    private readonly record struct LibcHeapAllocation(nint BaseAddress, nuint Size, nuint Alignment);
++    private readonly record struct LibcHeapAllocation(
++        nint BaseAddress,
++        nuint Size,
++        nuint Alignment,
++        nuint TotalSize,
++        bool HostMapped);
+     private readonly record struct MappedRegion(ulong Address, ulong Length, int Protection, bool IsFlexible,
+         bool IsDirect, ulong DirectStart, ulong BackingOffset = 0, bool IsReserved = false);
+     private readonly record struct BatchMapEntry(ulong Start, ulong Offset, ulong Length, byte Protection, byte Type, int Operation);
+@@ -690,6 +696,13 @@ public static partial class KernelMemoryCompatExports
+         return VsnprintfCore(ctx);
      }
  
 +    [SysAbiExport(
-+        Nid = "ay3uROQAc5A",
-+        ExportName = "opendir",
++        Nid = "1Pk0qZQGeWo",
++        ExportName = "sscanf",
 +        Target = Generation.Gen4 | Generation.Gen5,
 +        LibraryName = "libc")]
-+    public static int PosixOpendir(CpuContext ctx)
++    public static int Sscanf(CpuContext ctx) => SscanfCore(ctx);
++
+     [SysAbiExport(
+         Nid = "nJz16JE1txM",
+         ExportName = "swprintf",
+@@ -1148,17 +1161,18 @@ public static partial class KernelMemoryCompatExports
+         LibraryName = "libc")]
+     public static int Malloc(CpuContext ctx)
+     {
++        var size = ctx[CpuRegister.Rdi];
++        var alignment = size >= LargeLibcHeapThreshold ? LargeLibcHeapAlignment : DefaultLibcHeapAlignment;
+         ctx[CpuRegister.Rax] =
+-            TryAllocateLibcHeap(ctx[CpuRegister.Rdi], DefaultLibcHeapAlignment, zeroFill: false, out var address)
++            TryAllocateLibcHeap(size, alignment, zeroFill: false, out var address)
+                 ? address
+                 : 0;
+         TraceLibcAllocation(
+             ctx,
+             "malloc",
+-            size: ctx[CpuRegister.Rdi],
+-            alignment: DefaultLibcHeapAlignment,
+-            resultAddress: ctx[CpuRegister.Rax]);
+-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            size: size,
++            alignment: alignment,
++            resultAddress: ctx[CpuRegister.Rax]);        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+ 
+     [SysAbiExport(
+@@ -1457,19 +1471,6 @@ public static partial class KernelMemoryCompatExports
+             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+         }
+ 
+-        if (string.Equals(guestPath, "/download0/java25-vm-trace.log", StringComparison.Ordinal) &&
+-            IsMutatingOpen(flags))
+-        {
+-            var traceFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
+-            lock (_fdGate)
+-            {
+-                _openFiles[traceFd] = new MemoryStream();
+-                _vmTraceFd = traceFd;
+-            }
+-            ctx[CpuRegister.Rax] = unchecked((ulong)traceFd);
+-            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+-        }
+-
+         if (IsRandomDevicePath(guestPath) && (flags & O_DIRECTORY) == 0)
+         {
+             var randomFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
+@@ -1776,6 +1777,8 @@ public static partial class KernelMemoryCompatExports
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+ 
++    private static ulong _sdlVideoDriverEnvAddress;
++
+     [SysAbiExport(
+         Nid = "smbQukfxYJM",
+         ExportName = "getenv",
+@@ -1785,11 +1788,157 @@ public static partial class KernelMemoryCompatExports
+     {
+         // The title passes VM options explicitly. Returning NULL avoids leaking
+         // host environment variables into HotSpot while preserving libc ABI
+-        // (NULL means "not set" rather than an ORBIS error sentinel).
++        // (NULL means "not set" rather than an ORBIS error sentinel). The one
++        // exception is SDL_VIDEODRIVER: the bundled SDL3 carries the PS5 video
++        // driver, and SDL only selects it through this environment variable.
++        var nameAddress = ctx[CpuRegister.Rdi];
++        if (nameAddress != 0 &&
++            TryReadNullTerminatedUtf8(ctx, nameAddress, MaxGuestStringLength, out var name) &&
++            string.Equals(name, "SDL_VIDEODRIVER", StringComparison.Ordinal))
++        {
++            var value = "ps5\0"u8;
++            if (_sdlVideoDriverEnvAddress == 0)
++            {
++                if (!TryAllocateLibcHeap(
++                        (ulong)value.Length,
++                        DefaultLibcHeapAlignment,
++                        zeroFill: false,
++                        out _sdlVideoDriverEnvAddress))
++                {
++                    _sdlVideoDriverEnvAddress = 0;
++                    ctx[CpuRegister.Rax] = 0;
++                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++                }
++            }
++
++            if (ctx.Memory.TryWrite(_sdlVideoDriverEnvAddress, value))
++            {
++                ctx[CpuRegister.Rax] = _sdlVideoDriverEnvAddress;
++                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            }
++        }
++
+         ctx[CpuRegister.Rax] = 0;
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+ 
++    [SysAbiExport(
++        Nid = "VVJ-fuqpT0k",
++        ExportName = "ps5craft_getcwd",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int Ps5CraftGetcwd(CpuContext ctx)
 +    {
-+        // HotSpot probes <java.home>/lib/endorsed and /lib/ext during argument
-+        // finalization. An unresolved import leaves RAX with stale guest state,
-+        // which HotSpot reads as a valid DIR* and treats as "directory exists",
-+        // causing JNI_CreateJavaVM to fail. Return libc's NULL for missing
-+        // directories and an opaque local handle for real ones.
++        // HotSpot calls getcwd() while building the initial Java Properties.
++        // The EMU title always runs from /app0, so provide a deterministic path
++        // instead of relying on the host process working directory.
++        var bufferAddress = ctx[CpuRegister.Rdi];
++        var bufferSize = ctx[CpuRegister.Rsi];
++        if (bufferAddress == 0 || bufferSize == 0)
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++        }
++
++        var cwd = "/app0\0"u8;
++        var writeLength = (int)Math.Min((ulong)cwd.Length, bufferSize);
++        if (!ctx.Memory.TryWrite(bufferAddress, cwd[..writeLength]))
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++        }
++
++        ctx[CpuRegister.Rax] = bufferAddress;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "vhtcIgZG-Lk",
++        ExportName = "realpath",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixRealpath(CpuContext ctx)
++    {
++        // URLClassPath canonicalizes each -Djava.class.path entry. An unresolved
++        // realpath leaves RAX stale, so HotSpot silently drops every JAR and the
++        // application class cannot be loaded. Return the guest path itself: the
++        // title uses fixed absolute paths, and ResolveGuestPath performs the
++        // containment check before accepting one.
 +        var pathAddress = ctx[CpuRegister.Rdi];
-+        if (!TryReadCString(ctx, pathAddress, MaxGuestStringLength, out var pathBytes))
++        var resolvedAddress = ctx[CpuRegister.Rsi];
++        // OpenJDK calls realpath(path, resolved) with the two-argument BSD/glibc
++        // signature. RDX is caller-scratch here, not a buffer size, so use the
++        // PATH_MAX-sized buffer the JVM actually supplies.
++        var resolvedSize = (ulong)MaxGuestStringLength;
++        if (pathAddress == 0 || resolvedAddress == 0)
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        if (!TryReadNullTerminatedUtf8(ctx, pathAddress, MaxGuestStringLength, out var guestPath))
 +        {
 +            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
 +            ctx[CpuRegister.Rax] = 0;
 +            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +        }
 +
-+        var guestPath = Encoding.UTF8.GetString(pathBytes);
 +        var hostPath = ResolveGuestPath(guestPath);
-+        if (!HostDirectoryExists(hostPath))
++        if (string.IsNullOrEmpty(hostPath) ||
++            (!File.Exists(hostPath) && !HostDirectoryExists(hostPath)))
 +        {
 +            KernelRuntimeCompatExports.TrySetErrno(ctx, Enoent);
 +            ctx[CpuRegister.Rax] = 0;
 +            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +        }
 +
-+        var handleValue = (ulong)Interlocked.Increment(ref _nextPosixDirectoryHandle);
-+        var handle = 0xD1F0000000000000UL | handleValue;
-+        lock (_posixDirectoryHandles)
++        var canonical = NormalizeGuestRealpath(guestPath);
++        var bytes = Encoding.UTF8.GetBytes(canonical);
++        if ((ulong)bytes.Length + 1 > resolvedSize)
 +        {
-+            _posixDirectoryHandles.Add(handle);
-+        }
-+
-+        ctx[CpuRegister.Rax] = handle;
-+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+    }
-+
-+    [SysAbiExport(
-+        Nid = "XepdqehVYe4",
-+        ExportName = "closedir",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libc")]
-+    public static int PosixClosedir(CpuContext ctx)
-+    {
-+        var handle = ctx[CpuRegister.Rdi];
-+        bool removed;
-+        lock (_posixDirectoryHandles)
-+        {
-+            removed = _posixDirectoryHandles.Remove(handle);
-+        }
-+
-+        if (!removed)
-+        {
-+            KernelRuntimeCompatExports.TrySetErrno(ctx, Ebadf);
-+            ctx[CpuRegister.Rax] = ulong.MaxValue;
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
++            ctx[CpuRegister.Rax] = 0;
 +            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +        }
 +
-+        ctx[CpuRegister.Rax] = 0;
++        if (!TryWriteCompat(ctx, resolvedAddress, bytes) ||
++            !TryWriteCompat(ctx, resolvedAddress + (ulong)bytes.Length, new byte[] { 0 }))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        ctx[CpuRegister.Rax] = resolvedAddress;
 +        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +    }
 +
-+    [SysAbiExport(
-+        Nid = "smbQukfxYJM",
-+        ExportName = "getenv",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libc")]
-+    public static int PosixGetenv(CpuContext ctx)
++    private static string NormalizeGuestRealpath(string guestPath)
 +    {
-+        // The title passes VM options explicitly. Returning NULL avoids leaking
-+        // host environment variables into HotSpot while preserving libc ABI
-+        // (NULL means "not set" rather than an ORBIS error sentinel).
-+        ctx[CpuRegister.Rax] = 0;
-+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        var absolute = guestPath.StartsWith('/')
++            ? guestPath
++            : "/app0/" + guestPath.TrimStart('/');
++        var parts = new List<string>();
++        foreach (var part in absolute.Split('/', StringSplitOptions.RemoveEmptyEntries))
++        {
++            if (part == ".")
++            {
++                continue;
++            }
++            if (part == "..")
++            {
++                if (parts.Count > 0)
++                {
++                    parts.RemoveAt(parts.Count - 1);
++                }
++                continue;
++            }
++            parts.Add(part);
++        }
++        return parts.Count == 0 ? "/" : "/" + string.Join('/', parts);
 +    }
 +
      [SysAbiExport(
          Nid = "E6ao34wPw+U",
          ExportName = "stat",
-@@ -2355,7 +2450,7 @@ public static partial class KernelMemoryCompatExports
+@@ -1803,11 +1952,59 @@ public static partial class KernelMemoryCompatExports
+             : PosixFailure(ctx, result);
+     }
+ 
++    [SysAbiExport(
++        Nid = "8vE6Z6VEYyk",
++        ExportName = "access",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixAccess(CpuContext ctx)
++    {
++        var pathAddress = ctx[CpuRegister.Rdi];
++        if (pathAddress == 0 ||
++            !TryReadNullTerminatedUtf8(ctx, pathAddress, MaxGuestStringLength, out var guestPath) ||
++            string.IsNullOrEmpty(guestPath))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
++            ctx[CpuRegister.Rax] = ulong.MaxValue;
++            return -1;
++        }
++
++        var hostPath = ResolveGuestPath(guestPath);
++        if (!File.Exists(hostPath) && !Directory.Exists(hostPath))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Enoent);
++            ctx[CpuRegister.Rax] = ulong.MaxValue;
++            return -1;
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return 0;
++    }
++
+     // POSIX open(2): translates a failed raw open into -1/errno. On success
+     // KernelOpenCore already writes the fd into RAX (the import bridge
+     // prefers a written RAX over the return value), so returning 0 is correct.
+     public static int PosixOpen(CpuContext ctx)
+     {
++        var pathAddress = ctx[CpuRegister.Rdi];
++        var flags = ctx[CpuRegister.Rsi];
++
++        // JDK 25's UnixNativeDispatcher_realpath0 walks absolute paths with
++        // openat(), starting at open("/", O_DIRECTORY). The guest has no single
++        // host directory for "/"; failing with ENOTDIR takes the JDK's built-in
++        // fallback to realpath(path, resolved), which the PS5Craft HLE shim
++        // resolves against the guest mount table. ENOENT here makes the fallback
++        // unreachable and surfaces as NoSuchFileException for every absolute path.
++        if (pathAddress != 0 &&
++            (flags & O_DIRECTORY) != 0 &&
++            TryReadNullTerminatedUtf8(ctx, pathAddress, MaxGuestStringLength, out var openPath) &&
++            string.Equals(openPath, "/", StringComparison.Ordinal))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Enotdir);
++            ctx[CpuRegister.Rax] = ulong.MaxValue;
++            return -1;
++        }
++
+         var result = KernelOpenCore(ctx);
+         return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+             ? 0
+@@ -2705,8 +2902,7 @@ public static partial class KernelMemoryCompatExports
+     {
+         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+         var bufferAddress = ctx[CpuRegister.Rsi];
+-        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
+-        if (requested < 0 || (requested > 0 && bufferAddress == 0))
++        var requested = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);        if (requested < 0 || (requested > 0 && bufferAddress == 0))
          {
-             var randomBytes = GC.AllocateUninitializedArray<byte>(requested);
-             RandomNumberGenerator.Fill(randomBytes);
--            if (!ctx.Memory.TryWrite(bufferAddress, randomBytes))
-+            if (!TryWriteCompat(ctx, bufferAddress, randomBytes))
-             {
-                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-             }
-@@ -2428,7 +2523,7 @@ public static partial class KernelMemoryCompatExports
-                 HostMovieBridge.WaitForHostPlaybackToFinish(OpenFileName(stream));
-             }
+             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
          }
--        if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
-+        if (read > 0 && !TryWriteCompat(ctx, bufferAddress, buffer.AsSpan(0, read)))
-         {
-             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-         }
-@@ -2619,11 +2714,24 @@ public static partial class KernelMemoryCompatExports
-         var payload = requested == 0
-             ? Array.Empty<byte>()
-             : GC.AllocateUninitializedArray<byte>(requested);
--        if (requested > 0 && !ctx.Memory.TryRead(bufferAddress, payload))
-+        if (requested > 0 && !TryReadCompat(ctx, bufferAddress, payload))
-         {
+@@ -2719,19 +2915,6 @@ public static partial class KernelMemoryCompatExports
              return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
          }
  
-+        if (fd == Volatile.Read(ref _vmTraceFd))
-+        {
-+            var traceText = Encoding.UTF8.GetString(payload);
-+            foreach (var traceLine in traceText.Split('\n'))
-+            {
-+                var message = traceLine.TrimEnd('\r');
-+                if (message.Length != 0)
-+                    Console.Error.WriteLine($"[VMTRACE] {message}");
-+            }
-+            ctx[CpuRegister.Rax] = unchecked((ulong)requested);
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
+-        if (fd == Volatile.Read(ref _vmTraceFd))
+-        {
+-            var traceText = Encoding.UTF8.GetString(payload);
+-            foreach (var traceLine in traceText.Split('\n'))
+-            {
+-                var message = traceLine.TrimEnd('\r');
+-                if (message.Length != 0)
+-                    Console.Error.WriteLine($"[VMTRACE] {message}");
+-            }
+-            ctx[CpuRegister.Rax] = unchecked((ulong)requested);
+-            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+-        }
+-
          if (fd == 1 || fd == 2)
          {
              var text = Encoding.UTF8.GetString(payload);
-@@ -3871,17 +3979,25 @@ public static partial class KernelMemoryCompatExports
+@@ -3881,6 +4064,34 @@ public static partial class KernelMemoryCompatExports
+         LibraryName = "libKernel")]
+     public static int PosixMprotect(CpuContext ctx) => KernelMprotect(ctx);
+ 
++    [SysAbiExport(
++        Nid = "MKlW23dUNhU",
++        ExportName = "kernel_mprotect",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libKernel")]
++    public static int KernelMprotectCompat(CpuContext ctx)
++    {
++        var address = ctx[CpuRegister.Rdi];
++        var length = ctx[CpuRegister.Rsi];
++        var protection = unchecked((int)ctx[CpuRegister.Rdx]);
++        var result = ProtectMappedRange(ctx, address, length, protection);        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
++        {
++            return result;
++        }
++
++        // HotSpot's patched syscall wrappers allocate executable code pages with
++        // the HLE malloc export. Those pages are host heap memory rather than a
++        // tracked kernel mapping, so the generic mprotect path rejects them.
++        // Apply the host protection directly for ranges owned by the libc heap.
++        var heapRange = IsLibcHeapRange(address, length);
++        var hostProtected = TryProtectHostRange(address, length, protection);        if (hostProtected)
++        {
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        return result;
++    }
++
+     /// <summary>
+     /// POSIX alias of <see cref="KernelMunmap"/>; identical (addr, len) argument
+     /// order.
+@@ -3979,24 +4190,18 @@ public static partial class KernelMemoryCompatExports
  
          if (!TryReadCString(ctx, formatAddress, 1_048_576, out var formatBytes))
          {
-+            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] format read failed: addr=0x{formatAddress:X16}");
+-            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] format read failed: addr=0x{formatAddress:X16}");
              return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
          }
  
          var format = Encoding.UTF8.GetString(formatBytes);
          if (!TryCreateVaListCursor(ctx, vaListAddress, out var vaCursor))
          {
--            return WriteSnprintfOutput(ctx, destination, bufferSize, formatBytes);
-+            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] va_list read failed: addr=0x{vaListAddress:X16} format='{format}'");
-+            var fallbackResult = WriteSnprintfOutput(ctx, destination, bufferSize, formatBytes);
-+            if (fallbackResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-+                Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] fallback write failed: dst=0x{destination:X16} size={bufferSize}");
-+            return fallbackResult;
+-            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] va_list read failed: addr=0x{vaListAddress:X16} format='{format}'");
+             var fallbackResult = WriteSnprintfOutput(ctx, destination, bufferSize, formatBytes);
+-            if (fallbackResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+-                Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] fallback write failed: dst=0x{destination:X16} size={bufferSize}");
+             return fallbackResult;
          }
  
          var rendered = FormatString(ctx, format, ref vaCursor);
--        return WriteSnprintfOutput(ctx, destination, bufferSize, rendered);
-+        var result = WriteSnprintfOutput(ctx, destination, bufferSize, rendered);
-+        if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-+            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] write failed: dst=0x{destination:X16} size={bufferSize} format='{format}' rendered='{rendered}'");
-+        return result;
+         var result = WriteSnprintfOutput(ctx, destination, bufferSize, rendered);
+-        if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+-            Console.Error.WriteLine($"[LOADER][WARN][DBGVSN] write failed: dst=0x{destination:X16} size={bufferSize} format='{format}' rendered='{rendered}'");
+         return result;
      }
  
-     private static int SwprintfCore(CpuContext ctx)
-@@ -3979,13 +4095,13 @@ public static partial class KernelMemoryCompatExports
-         {
-             var maxWritable = (int)Math.Min((ulong)int.MaxValue, bufferSize - 1);
-             var copyLength = Math.Min(maxWritable, outputBytes.Length);
--            if (copyLength > 0 && !ctx.Memory.TryWrite(destination, outputBytes[..copyLength]))
-+            if (copyLength > 0 && !TryWriteCompat(ctx, destination, outputBytes[..copyLength]))
-             {
-                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-             }
+@@ -4591,13 +4796,18 @@ public static partial class KernelMemoryCompatExports
+                             _ => unchecked((int)argumentSource.NextGpArg())
+                         };
  
-             Span<byte> nullTerminator = stackalloc byte[1];
--            if (!ctx.Memory.TryWrite(destination + (ulong)copyLength, nullTerminator))
-+            if (!TryWriteCompat(ctx, destination + (ulong)copyLength, nullTerminator))
-             {
-                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-             }
-@@ -5890,7 +6006,7 @@ public static partial class KernelMemoryCompatExports
-         return true;
+-                        var formatted = value.ToString(CultureInfo.InvariantCulture);
+-                        if (showSign && value >= 0)
+-                            formatted = "+" + formatted;
+-                        else if (spaceForSign && value >= 0)
+-                            formatted = " " + formatted;
+-
+-                        sb.Append(PadString(formatted, width, leftAlign, padWithZero && !leftAlign));
++                        var negative = value < 0;
++                        var magnitude = negative
++                            ? unchecked((ulong)(-(value + 1))) + 1
++                            : unchecked((ulong)value);
++                        var digits = ApplyIntegerPrecision(
++                            magnitude.ToString(CultureInfo.InvariantCulture), precision);
++                        var sign = negative ? "-" : showSign ? "+" : spaceForSign ? " " : "";
++                        var formatted = sign + digits;
++
++                        // A precision suppresses the C '0' flag for integer conversions.
++                        sb.Append(PadString(formatted, width, leftAlign,
++                            padWithZero && !leftAlign && precision < 0));
+                     }
+                     break;
+ 
+@@ -4611,8 +4821,10 @@ public static partial class KernelMemoryCompatExports
+                             _ => (uint)argumentSource.NextGpArg()
+                         };
+ 
+-                        var formatted = value.ToString(CultureInfo.InvariantCulture);
+-                        sb.Append(PadString(formatted, width, leftAlign, padWithZero && !leftAlign));
++                        var formatted = ApplyIntegerPrecision(
++                            value.ToString(CultureInfo.InvariantCulture), precision);
++                        sb.Append(PadString(formatted, width, leftAlign,
++                            padWithZero && !leftAlign && precision < 0));
+                     }
+                     break;
+ 
+@@ -4627,14 +4839,17 @@ public static partial class KernelMemoryCompatExports
+                             _ => (uint)argumentSource.NextGpArg()
+                         };
+ 
+-                        var formatted = specifier == 'x'
+-                            ? value.ToString("x", CultureInfo.InvariantCulture)
+-                            : value.ToString("X", CultureInfo.InvariantCulture);
++                        var digits = ApplyIntegerPrecision(
++                            specifier == 'x'
++                                ? value.ToString("x", CultureInfo.InvariantCulture)
++                                : value.ToString("X", CultureInfo.InvariantCulture),
++                            precision);
+ 
+                         if (alternateForm && value != 0)
+-                            formatted = specifier == 'x' ? "0x" + formatted : "0X" + formatted;
++                            digits = specifier == 'x' ? "0x" + digits : "0X" + digits;
+ 
+-                        sb.Append(PadString(formatted, width, leftAlign, padWithZero && !leftAlign));
++                        sb.Append(PadString(digits, width, leftAlign,
++                            padWithZero && !leftAlign && precision < 0));
+                     }
+                     break;
+ 
+@@ -4648,11 +4863,13 @@ public static partial class KernelMemoryCompatExports
+                             _ => (uint)argumentSource.NextGpArg()
+                         };
+ 
+-                        var formatted = Convert.ToString((long)value, 8);
++                        var digits = ApplyIntegerPrecision(
++                            Convert.ToString(unchecked((long)value), 8), precision);
+                         if (alternateForm && value != 0)
+-                            formatted = "0" + formatted;
++                            digits = "0" + digits;
+ 
+-                        sb.Append(PadString(formatted, width, leftAlign, padWithZero && !leftAlign));
++                        sb.Append(PadString(digits, width, leftAlign,
++                            padWithZero && !leftAlign && precision < 0));
+                     }
+                     break;
+ 
+@@ -4782,6 +4999,17 @@ public static partial class KernelMemoryCompatExports
+         return value;
      }
  
--    private static bool TryReadUInt32Compat(CpuContext ctx, ulong address, out uint value)
-+    internal static bool TryReadUInt32Compat(CpuContext ctx, ulong address, out uint value)
++    private static string ApplyIntegerPrecision(string digits, int precision)
++    {
++        if (precision < 0)
++            return digits;
++        if (precision == 0 && digits == "0")
++            return "";
++        return digits.Length >= precision
++            ? digits
++            : new string('0', precision - digits.Length) + digits;
++    }
++
+     private static string PadString(string str, int width, bool leftAlign, bool padWithZero)
      {
-         Span<byte> bytes = stackalloc byte[sizeof(uint)];
-         if (!TryReadCompat(ctx, address, bytes))
-@@ -5956,7 +6072,7 @@ public static partial class KernelMemoryCompatExports
-         return true;
-     }
- 
--    private static bool TryWriteUInt32Compat(CpuContext ctx, ulong address, uint value)
-+    internal static bool TryWriteUInt32Compat(CpuContext ctx, ulong address, uint value)
-     {
-         Span<byte> bytes = stackalloc byte[sizeof(uint)];
-         BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
-@@ -6886,6 +7002,18 @@ public static partial class KernelMemoryCompatExports
+         if (width <= str.Length)
+@@ -6767,18 +6995,38 @@ public static partial class KernelMemoryCompatExports
              return false;
          }
  
-+        // HotSpot's own allocator and the loader can hand back direct host pointers
-+        // in the high user range. HostMemory's page table only covers regions it
-+        // allocated itself, so VirtualQuery would reject these even though the
-+        // pointer is live for the lifetime of the emulated process. Guest-memory
-+        // access is always attempted first by TryReadCompat/TryWriteCompat, so
-+        // accepting this range here only enables the host fallback.
-+        const ulong directHostRangeStart = 0x0000500000000000UL;
-+        if (address >= directHostRangeStart)
-+        {
-+            return true;
-+        }
-+
-         if (ulong.MaxValue - address < length - 1)
++        // Large allocations are used for JIT/code-cache pages that HotSpot later
++        // changes to executable. Back them with HostMemory so VirtualQuery and
++        // VirtualProtect see a tracked mapping; ordinary heap traffic stays on
++        // the lighter AllocHGlobal path.
++        var hostMapped = requestedSize >= LargeLibcHeapThreshold;
+         nint baseAddress;
+-        try
+-        {
+-            baseAddress = Marshal.AllocHGlobal(checked((nint)totalSize));
+-        }
+-        catch (OutOfMemoryException)
++        if (hostMapped)
          {
-             return false;
-@@ -7649,6 +7777,86 @@ public static partial class KernelMemoryCompatExports
-         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+-            return false;
++            baseAddress = (nint)HostMemory.Alloc(
++                null,
++                totalSize,
++                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
++                HostMemory.PAGE_READWRITE);
++            if (baseAddress == 0)
++            {
++                return false;
++            }
+         }
+-        catch (OverflowException)
++        else
+         {
+-            return false;
++            try
++            {
++                baseAddress = Marshal.AllocHGlobal(checked((nint)totalSize));
++            }
++            catch (OutOfMemoryException)
++            {
++                return false;
++            }
++            catch (OverflowException)
++            {
++                return false;
++            }
+         }
+ 
+         if (baseAddress == 0)
+@@ -6789,7 +7037,12 @@ public static partial class KernelMemoryCompatExports
+         var alignedAddress = AlignUp(unchecked((ulong)baseAddress) + (ulong)IntPtr.Size, (ulong)alignment);
+         lock (_libcAllocGate)
+         {
+-            _libcAllocations[alignedAddress] = new LibcHeapAllocation(baseAddress, actualSize, alignment);
++            _libcAllocations[alignedAddress] = new LibcHeapAllocation(
++                baseAddress,
++                actualSize,
++                alignment,
++                totalSize,
++                hostMapped);
+         }
+ 
+         try
+@@ -6901,7 +7154,7 @@ public static partial class KernelMemoryCompatExports
+         return true;
      }
  
-+    [SysAbiExport(
-+        Nid = "enqPGLfmVNU",
-+        ExportName = "strtok_r",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libc")]
-+    public static int StrtokR(CpuContext ctx)
+-    private static void FreeLibcHeap(ulong address)
++    private static unsafe void FreeLibcHeap(ulong address)
+     {
+         if (address == 0)
+         {
+@@ -6917,9 +7170,41 @@ public static partial class KernelMemoryCompatExports
+             }
+         }
+ 
++        if (allocation.HostMapped)
++        {
++            // HotSpot probes several large reservations, releases them, and then
++            // commits a fixed-range guard page inside one of those addresses.
++            // Releasing the host mapping here would leave that fixed commit with
++            // no backing memory. Keep large host mappings alive; the number of
++            // reservations is small and POSIX anonymous mappings are lazy.
++            return;
++        }
++
+         Marshal.FreeHGlobal(allocation.BaseAddress);
+     }
+ 
++    private static bool IsLibcHeapRange(ulong address, ulong length)
 +    {
-+        var stringAddress = ctx[CpuRegister.Rdi];
-+        var delimiterAddress = ctx[CpuRegister.Rsi];
-+        var savePointerAddress = ctx[CpuRegister.Rdx];
-+        if (delimiterAddress == 0 || savePointerAddress == 0)
++        if (address == 0 || length == 0 || !TryAddU64(address, length, out var end))
 +        {
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            return false;
 +        }
 +
-+        if (!TryReadCString(ctx, delimiterAddress, MaxGuestStringLength, out var delimiterBytes))
++        lock (_libcAllocGate)
 +        {
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
-+        ulong cursor;
-+        if (stringAddress != 0)
-+        {
-+            cursor = stringAddress;
-+        }
-+        else if (!TryReadUInt64Compat(ctx, savePointerAddress, out cursor) || cursor == 0)
-+        {
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
-+        if (!TryReadCString(ctx, cursor, MaxGuestStringLength, out var stringBytes))
-+        {
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
-+        static bool IsDelimiter(byte value, byte[] delimiters)
-+        {
-+            foreach (var delimiter in delimiters)
++            foreach (var (allocationAddress, allocation) in _libcAllocations)
 +            {
-+                if (delimiter == value)
++                var allocationEnd = allocationAddress + (ulong)allocation.Size;
++                if (address >= allocationAddress && end <= allocationEnd)
 +                {
 +                    return true;
 +                }
 +            }
-+            return false;
 +        }
 +
-+        var index = 0;
-+        while (index < stringBytes.Length && IsDelimiter(stringBytes[index], delimiterBytes))
-+        {
-+            index++;
-+        }
-+
-+        if (index == stringBytes.Length)
-+        {
-+            _ = TryWriteUInt64Compat(ctx, savePointerAddress, 0);
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-+        }
-+
-+        var tokenStart = cursor + (ulong)index;
-+        while (index < stringBytes.Length && !IsDelimiter(stringBytes[index], delimiterBytes))
-+        {
-+            index++;
-+        }
-+
-+        var nextCursor = cursor + (ulong)index;
-+        if (index < stringBytes.Length)
-+        {
-+            nextCursor++;
-+        }
-+        _ = TryWriteUInt64Compat(ctx, savePointerAddress, nextCursor);
-+        ctx[CpuRegister.Rax] = tokenStart;
-+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        return false;
 +    }
 +
-     [SysAbiExport(
-         Nid = "ob5xAW4ln-0",
-         ExportName = "strchr",
-@@ -7660,14 +7868,21 @@ public static partial class KernelMemoryCompatExports
-         var needle = unchecked((byte)ctx[CpuRegister.Rsi]);
-         if (address == 0)
-         {
--            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-         }
- 
-         // The terminator counts as part of the scanned range, so strchr(s, '\0')
-         // returns a pointer to the string's null byte just like a native libc.
-+        // libc has no ORBIS error return: a missing match is NULL. Returning an
-+        // ORBIS error here makes callers such as HotSpot's os::split_path treat
-+        // the sign-extended error as a valid pointer and loop on error+1.
-         if (!TryScanCString(ctx, address, needle, findLast: false, out var match))
-         {
--            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-+            Console.Error.WriteLine(
-+                $"[LOADER][WARN] strchr scan failed: addr=0x{address:X16} needle=0x{needle:X2}");
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-         }
- 
-         ctx[CpuRegister.Rax] = match;
-@@ -7789,12 +8004,16 @@ public static partial class KernelMemoryCompatExports
-         var needle = unchecked((byte)ctx[CpuRegister.Rsi]);
-         if (address == 0)
-         {
--            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-         }
- 
-         if (!TryScanCString(ctx, address, needle, findLast: true, out var match))
-         {
--            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-+            Console.Error.WriteLine(
-+                $"[LOADER][WARN] strrchr scan failed: addr=0x{address:X16} needle=0x{needle:X2}");
-+            ctx[CpuRegister.Rax] = 0;
-+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-         }
- 
-         ctx[CpuRegister.Rax] = match;
-@@ -8148,4 +8367,227 @@ public static partial class KernelMemoryCompatExports
- 
-     private static byte ToAsciiLower(byte value) =>
-         value is >= (byte)'A' and <= (byte)'Z' ? (byte)(value + 32) : value;
+     private static bool TryMultiplyAllocationSize(ulong left, ulong right, out nuint size)
+     {
+         size = 0;
+@@ -7524,11 +7809,11 @@ public static partial class KernelMemoryCompatExports
+          string.Equals(normalizedGuestPath, "/hostapp", StringComparison.OrdinalIgnoreCase) ||
+          normalizedGuestPath.StartsWith("/hostapp/", StringComparison.OrdinalIgnoreCase) ||
+          string.Equals(normalizedGuestPath, "/devlog/app", StringComparison.OrdinalIgnoreCase) ||
+-         normalizedGuestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase) ||
+-         string.Equals(normalizedGuestPath, "/temp0", StringComparison.OrdinalIgnoreCase) ||
+-         normalizedGuestPath.StartsWith("/temp0/", StringComparison.OrdinalIgnoreCase) ||
+-         string.Equals(normalizedGuestPath, "/download0", StringComparison.OrdinalIgnoreCase) ||
+-         normalizedGuestPath.StartsWith("/download0/", StringComparison.OrdinalIgnoreCase));
++         normalizedGuestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase));
 +
++        // /temp0 and /download0 are writable. Caching a missing path there is
++        // unsafe because Java creates those directories lazily; the cached miss
++        // survives even after mkdir succeeds and produces NoSuchFileException.
+ 
+     private static bool IsNegativeStatCached(string cacheKey)
+     {
+@@ -7711,6 +7996,32 @@ public static partial class KernelMemoryCompatExports
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+ 
 +    [SysAbiExport(
-+        Nid = "psx0YiAKm7k",
-+        ExportName = "fegetenv",
++        Nid = "pXvbDfchu6k",
++        ExportName = "strncasecmp",
 +        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelFegetenv(CpuContext ctx)
++        LibraryName = "libc")]
++    public static int Strncasecmp(CpuContext ctx)
 +    {
-+        ulong address = ctx[CpuRegister.Rdi];
-+        if (address == 0)
-+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
++        var left = ctx[CpuRegister.Rdi];
++        var right = ctx[CpuRegister.Rsi];
++        var limit = ctx[CpuRegister.Rdx];
++        if (left == 0 || right == 0)
++        {
++            ctx[CpuRegister.Rax] = left == right ? 0uL : 1uL;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
 +
-+        Span<byte> state = stackalloc byte[32];
-+        ReadOnlySpan<uint> neutral = [
-+            0x0000037f, 0x00000000, 0x0000ffff, 0x00000000,
-+            0x00000000, 0x00000000, 0x00000000, 0x00001f80,
-+        ];
-+        for (var i = 0; i < neutral.Length; i++)
-+            BinaryPrimitives.WriteUInt32LittleEndian(state.Slice(i * sizeof(uint), sizeof(uint)), neutral[i]);
-+
-+        if (!TryWriteCompat(ctx, address, state))
++        if (!TryCompareStringsCaseInsensitive(ctx, left, right, limit, out var compare))
++        {
++            ctx[CpuRegister.Rax] = 1;
 +            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
++        }
 +
-+        ctx[CpuRegister.Rax] = 0;
++        ctx[CpuRegister.Rax] = unchecked((ulong)compare);
 +        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +    }
 +
-+    [SysAbiExport(
-+        Nid = "4uJJNi+C9wk",
-+        ExportName = "isalnum",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelIsAlnum(CpuContext ctx)
+     // sprintf/vsprintf are served from the same HLE formatting engine as snprintf/vsnprintf
+     // instead of falling through to the game's bundled libc.
+     [SysAbiExport(
+@@ -8454,6 +8765,298 @@ public static partial class KernelMemoryCompatExports
+         LibraryName = "libKernel")]
+     public static int KernelAtol(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: false, unsigned: false, fixedBase: 10);
+ 
++    private enum SscanfLength
 +    {
-+        ulong arg = ctx[CpuRegister.Rdi];
-+        var result = arg <= byte.MaxValue && IsAsciiAlnum((int)arg);
-+        ctx[CpuRegister.Rax] = result ? 1UL : 0UL;
-+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        None,
++        Char,
++        Short,
++        Long,
++        LongLong,
++        IntMax,
++        Size,
++        PtrDiff,
 +    }
 +
-+    private static bool IsAsciiAlnum(int value) =>
-+        value is >= (int)'0' and <= (int)'9' or
-+                  >= (int)'A' and <= (int)'Z' or
-+                  >= (int)'a' and <= (int)'z';
-+
-+    [SysAbiExport(
-+        Nid = "VOBg+iNwB-4",
-+        ExportName = "strtoll",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelStrtoll(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: true, unsigned: false);
-+
-+    [SysAbiExport(
-+        Nid = "mXlxhmLNMPg",
-+        ExportName = "strtol",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelStrtol(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: true, unsigned: false);
-+
-+    [SysAbiExport(
-+        Nid = "QxmSHBCuKTk",
-+        ExportName = "strtoul",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelStrtoul(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: true, unsigned: true);
-+
-+    [SysAbiExport(
-+        Nid = "5OqszGpy7Mg",
-+        ExportName = "strtoull",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelStrtoull(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: true, unsigned: true);
-+
-+    [SysAbiExport(
-+        Nid = "fPxypibz2MY",
-+        ExportName = "atoi",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelAtoi(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: false, unsigned: false, fixedBase: 10);
-+
-+    [SysAbiExport(
-+        Nid = "+my9jdHCMIQ",
-+        ExportName = "atol",
-+        Target = Generation.Gen4 | Generation.Gen5,
-+        LibraryName = "libKernel")]
-+    public static int KernelAtol(CpuContext ctx) => ParseGuestInteger(ctx, writeEnd: false, unsigned: false, fixedBase: 10);
-+
-+    private static int ParseGuestInteger(CpuContext ctx, bool writeEnd, bool unsigned, int fixedBase = 0)
++    private static int SscanfCore(CpuContext ctx)
 +    {
-+        ulong cursor = ctx[CpuRegister.Rdi];
-+        ulong endptr = ctx[CpuRegister.Rsi];
-+        int requestedBase = fixedBase != 0 ? fixedBase : (int)(uint)ctx[CpuRegister.Rdx];
-+        if (requestedBase < 0 || requestedBase > 36 || requestedBase == 1)
++        var inputAddress = ctx[CpuRegister.Rdi];
++        var formatAddress = ctx[CpuRegister.Rsi];
++        if (inputAddress == 0 || formatAddress == 0 ||
++            !TryReadCString(ctx, inputAddress, 1_048_576, out var inputBytes) ||
++            !TryReadCString(ctx, formatAddress, 1_048_576, out var formatBytes))
 +        {
-+            if (writeEnd && endptr != 0)
-+                _ = TryWriteUInt64Compat(ctx, endptr, cursor);
-+            ctx[CpuRegister.Rax] = 0;
++            ctx[CpuRegister.Rax] = unchecked((ulong)-1);
 +            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +        }
 +
-+        Span<byte> one = stackalloc byte[1];
-+        while (TryReadGuestByte(ctx, cursor, one, out var lead) && IsAsciiSpace(lead))
-+            cursor++;
-+        bool negative = false;
-+        if (TryReadGuestByte(ctx, cursor, one, out var sign) && sign is (byte)'+' or (byte)'-')
++        var format = Encoding.ASCII.GetString(formatBytes);
++        var arguments = new RegisterPrintfArgumentSource(ctx, gpIndex: 2);
++        var result = SscanfCore(ctx, inputBytes, format, ref arguments);        ctx[CpuRegister.Rax] = unchecked((ulong)result);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    private static int SscanfCore<TArgumentSource>(
++        CpuContext ctx,
++        byte[] input,
++        string format,
++        ref TArgumentSource arguments)
++        where TArgumentSource : struct, IPrintfArgumentSource
++    {
++        var inputPosition = 0;
++        var formatPosition = 0;
++        var assigned = 0;
++
++        while (formatPosition < format.Length)
 +        {
-+            negative = sign == (byte)'-';
-+            cursor++;
-+        }
-+        if (TryReadGuestByte(ctx, cursor, one, out var prefix0) && prefix0 == '0')
-+        {
-+            var afterZero = cursor + 1;
-+            if (TryReadCompat(ctx, afterZero, one))
++            var current = format[formatPosition];
++            if (IsAsciiSpaceChar(current))
 +            {
-+                if (one[0] is (byte)'x' or (byte)'X' && (requestedBase == 0 || requestedBase == 16))
++                while (formatPosition < format.Length && IsAsciiSpaceChar(format[formatPosition]))
++                    formatPosition++;
++                while (inputPosition < input.Length && IsAsciiSpace(input[inputPosition]))
++                    inputPosition++;
++                continue;
++            }
++
++            if (current != '%')
++            {
++                if (inputPosition >= input.Length || input[inputPosition] != (byte)current)
++                    return assigned;
++                inputPosition++;
++                formatPosition++;
++                continue;
++            }
++
++            formatPosition++;
++            if (formatPosition >= format.Length)
++                return assigned;
++
++            var suppress = false;
++            if (format[formatPosition] == '*')
++            {
++                suppress = true;
++                formatPosition++;
++                if (formatPosition >= format.Length)
++                    return assigned;
++            }
++
++            var width = 0;
++            while (formatPosition < format.Length && IsAsciiDigitChar(format[formatPosition]))
++            {
++                width = (width * 10) + (format[formatPosition] - '0');
++                formatPosition++;
++            }
++
++            var length = SscanfLength.None;
++            if (formatPosition < format.Length)
++            {
++                switch (format[formatPosition])
++                {
++                    case 'h':
++                        length = formatPosition + 1 < format.Length && format[formatPosition + 1] == 'h'
++                            ? SscanfLength.Char
++                            : SscanfLength.Short;
++                        formatPosition += length == SscanfLength.Char ? 2 : 1;
++                        break;
++                    case 'l':
++                        length = formatPosition + 1 < format.Length && format[formatPosition + 1] == 'l'
++                            ? SscanfLength.LongLong
++                            : SscanfLength.Long;
++                        formatPosition += length == SscanfLength.LongLong ? 2 : 1;
++                        break;
++                    case 'j':
++                        length = SscanfLength.IntMax;
++                        formatPosition++;
++                        break;
++                    case 'z':
++                        length = SscanfLength.Size;
++                        formatPosition++;
++                        break;
++                    case 't':
++                        length = SscanfLength.PtrDiff;
++                        formatPosition++;
++                        break;
++                    case 'L':
++                        length = SscanfLength.LongLong;
++                        formatPosition++;
++                        break;
++                }
++            }
++
++            if (formatPosition >= format.Length)
++                return assigned;
++
++            var conversion = format[formatPosition++];
++            if (conversion == '%')
++            {
++                if (inputPosition >= input.Length || input[inputPosition] != (byte)'%')
++                    return assigned;
++                inputPosition++;
++                continue;
++            }
++
++            if (conversion == 'n')
++            {
++                if (suppress)
++                    continue;
++                var pointer = arguments.NextGpArg();
++                if (!WriteSscanfInteger(ctx, pointer, (ulong)inputPosition))
++                    return assigned;
++                continue;
++            }
++
++            if (conversion == 'c')
++            {
++                var count = width == 0 ? 1 : width;
++                if (inputPosition >= input.Length)
++                    return assigned;
++                count = Math.Min(count, input.Length - inputPosition);
++                if (suppress)
++                {
++                    inputPosition += count;
++                    continue;
++                }
++
++                var pointer = arguments.NextGpArg();
++                if (!TryWriteCompat(ctx, pointer, input.AsSpan(inputPosition, count)))
++                    return assigned;
++                inputPosition += count;
++                assigned++;
++                continue;
++            }
++
++            if (conversion == 's')
++            {
++                while (inputPosition < input.Length && IsAsciiSpace(input[inputPosition]))
++                    inputPosition++;
++                var start = inputPosition;
++                var limit = width == 0 ? input.Length : Math.Min(input.Length, start + width);
++                while (inputPosition < limit && !IsAsciiSpace(input[inputPosition]))
++                    inputPosition++;
++                if (inputPosition == start)
++                    return assigned;
++                if (suppress)
++                    continue;
++
++                var pointer = arguments.NextGpArg();
++                var payload = new byte[inputPosition - start + 1];
++                input.AsSpan(start, inputPosition - start).CopyTo(payload);
++                if (!TryWriteCompat(ctx, pointer, payload))
++                    return assigned;
++                assigned++;
++                continue;
++            }
++
++            if (conversion is not ('d' or 'i' or 'u' or 'o' or 'x' or 'X' or 'p'))
++                return assigned;
++
++            while (inputPosition < input.Length && IsAsciiSpace(input[inputPosition]))
++                inputPosition++;
++            if (inputPosition >= input.Length)
++                return assigned;
++
++            var negative = false;
++            if (input[inputPosition] is (byte)'+' or (byte)'-')
++            {
++                negative = input[inputPosition] == (byte)'-';
++                inputPosition++;
++            }
++
++            var requestedBase = conversion switch
++            {
++                'd' or 'u' => 10,
++                'o' => 8,
++                'x' or 'X' or 'p' => 16,
++                _ => 0,
++            };
++            if (requestedBase == 0 && inputPosition < input.Length && input[inputPosition] == '0')
++            {
++                if (inputPosition + 1 < input.Length && input[inputPosition + 1] is (byte)'x' or (byte)'X')
 +                {
 +                    requestedBase = 16;
-+                    cursor = afterZero + 1;
++                    inputPosition += 2;
 +                }
-+                else if (requestedBase == 0)
++                else
 +                {
 +                    requestedBase = 8;
 +                }
 +            }
-+            else if (requestedBase == 0)
++            else if (requestedBase == 16 && inputPosition + 1 < input.Length &&
++                     input[inputPosition] == '0' && input[inputPosition + 1] is (byte)'x' or (byte)'X')
 +            {
-+                requestedBase = 8;
++                inputPosition += 2;
 +            }
-+        }
-+        if (requestedBase == 0)
-+            requestedBase = 10;
++            requestedBase = requestedBase == 0 ? 10 : requestedBase;
 +
-+        ulong magnitude = 0;
-+        bool any = false;
-+        while (TryReadGuestByte(ctx, cursor, one, out var ch))
-+        {
-+            int digit = ch switch
++            var magnitude = 0UL;
++            var any = false;
++            while (inputPosition < input.Length)
 +            {
-+                >= (byte)'0' and <= (byte)'9' => ch - '0',
-+                >= (byte)'a' and <= (byte)'z' => ch - 'a' + 10,
-+                >= (byte)'A' and <= (byte)'Z' => ch - 'A' + 10,
-+                _ => -1,
-+            };
-+            if (digit < 0 || digit >= requestedBase)
-+                break;
-+            magnitude = unchecked(magnitude * (ulong)requestedBase + (ulong)digit);
-+            any = true;
-+            cursor++;
++                var digit = input[inputPosition] switch
++                {
++                    >= (byte)'0' and <= (byte)'9' => input[inputPosition] - '0',
++                    >= (byte)'a' and <= (byte)'f' => input[inputPosition] - 'a' + 10,
++                    >= (byte)'A' and <= (byte)'F' => input[inputPosition] - 'A' + 10,
++                    _ => -1,
++                };
++                if (digit < 0 || digit >= requestedBase)
++                    break;
++                magnitude = unchecked((magnitude * (ulong)requestedBase) + (ulong)digit);
++                inputPosition++;
++                any = true;
++            }
++
++            if (!any)
++                return assigned;
++            if (suppress)
++                continue;
++
++            var destination = arguments.NextGpArg();
++            var bits = negative ? unchecked(0UL - magnitude) : magnitude;
++            if (!WriteSscanfInteger(ctx, destination, bits, length))
++                return assigned;
++            assigned++;
 +        }
 +
-+        if (writeEnd && endptr != 0)
-+            _ = TryWriteUInt64Compat(ctx, endptr, any ? cursor : ctx[CpuRegister.Rdi]);
-+        ctx[CpuRegister.Rax] = any
-+            ? (unsigned && negative ? unchecked(0UL - magnitude) : magnitude)
-+            : 0;
-+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        return assigned;
 +    }
 +
-+    private static bool TryReadGuestByte(CpuContext ctx, ulong address, Span<byte> one, out byte value)
++    private static bool IsAsciiDigitChar(char value) => value is >= '0' and <= '9';
++
++    private static bool IsAsciiSpaceChar(char value) =>
++        value is ' ' or '\t' or '\n' or '\v' or '\f' or '\r';
++
++    private static bool WriteSscanfInteger(
++        CpuContext ctx,
++        ulong pointer,
++        ulong bits,
++        SscanfLength length = SscanfLength.None)
 +    {
-+        value = 0;
-+        if (!TryReadCompat(ctx, address, one))
++        if (pointer == 0)
 +            return false;
-+        value = one[0];
-+        return true;
++
++        var size = length switch
++        {
++            SscanfLength.Char => 1,
++            SscanfLength.Short => 2,
++            SscanfLength.Long or SscanfLength.LongLong or SscanfLength.IntMax
++                or SscanfLength.Size or SscanfLength.PtrDiff => 8,
++            _ => 4,
++        };
++
++        if (size == 8)
++            return TryWriteUInt64Compat(ctx, pointer, bits);
++        if (size == 4)
++            return TryWriteUInt32Compat(ctx, pointer, (uint)bits);
++
++        Span<byte> bytes = stackalloc byte[size];
++        if (size == 2)
++            BinaryPrimitives.WriteUInt16LittleEndian(bytes, (ushort)bits);
++        else
++            bytes[0] = (byte)bits;
++        return TryWriteCompat(ctx, pointer, bytes);
 +    }
 +
-+    private static bool IsAsciiSpace(byte value) =>
-+        value is 0x20 or 0x09 or 0x0A or 0x0B or 0x0C or 0x0D;
+     private static int ParseGuestInteger(CpuContext ctx, bool writeEnd, bool unsigned, int fixedBase = 0)
+     {
+         ulong cursor = ctx[CpuRegister.Rdi];
+@@ -8590,4 +9193,97 @@ public static partial class KernelMemoryCompatExports
+         ctx[CpuRegister.Rax] = 0;
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
 +
 +    [SysAbiExport(
-+        Nid = "DFmMT80xcNI",
-+        ExportName = "sysctl",
++        Nid = "MhC53TKmjVA",
++        ExportName = "sysctlbyname",
 +        Target = Generation.Gen4 | Generation.Gen5,
 +        LibraryName = "libKernel")]
-+    public static int KernelSysctl(CpuContext ctx)
++    public static int KernelSysctlByName(CpuContext ctx)
 +    {
-+        var name = ctx[CpuRegister.Rdi];
-+        var nameLen = ctx[CpuRegister.Rsi];
-+        var oldp = ctx[CpuRegister.Rdx];
-+        var oldlenp = ctx[CpuRegister.Rcx];
-+        if (nameLen < 2 ||
-+            !TryReadUInt32Compat(ctx, name, out var name0) ||
-+            !TryReadUInt32Compat(ctx, name + 4, out var name1) ||
-+            !TryReadUInt64Compat(ctx, oldlenp, out var oldLen))
++        // The bundled Java runtime seeds SecureRandom through
++        // sysctlbyname("kern.rng_pseudo", ...) on PS5. Supply host-quality
++        // entropy and report the exact byte count so the JVM accepts it.
++        var nameAddress = ctx[CpuRegister.Rdi];
++        var oldp = ctx[CpuRegister.Rsi];
++        var oldlenp = ctx[CpuRegister.Rdx];
++        if (!TryReadCString(ctx, nameAddress, MaxGuestStringLength, out var nameBytes) ||
++            !Encoding.UTF8.GetString(nameBytes).Equals("kern.rng_pseudo", StringComparison.Ordinal) ||
++            !TryReadUInt64Compat(ctx, oldlenp, out var oldLen) ||
++            oldLen == 0 || oldLen > 4096)
 +        {
 +            ctx[CpuRegister.Rax] = unchecked((ulong)-1);
 +            return -1;
 +        }
 +
-+        ulong value = 0;
-+        ulong valueSize = oldLen;
-+        switch (((ulong)name0 << 32) | name1)
++        var count = (int)oldLen;
++        if (oldp != 0)
 +        {
-+            case 0x0000000300000006UL: // CTL_HW/HW_NCPU
-+                if (oldLen < 4)
-+                {
-+                    ctx[CpuRegister.Rax] = unchecked((ulong)-1);
-+                    return -1;
-+                }
-+                value = 8;
-+                valueSize = 4;
-+                _ = TryWriteUInt32Compat(ctx, oldp, (uint)value);
-+                break;
-+            case 0x0000000500000006UL: // CTL_HW/HW_PHYSMEM
-+                if (oldLen < 8)
-+                {
-+                    ctx[CpuRegister.Rax] = unchecked((ulong)-1);
-+                    return -1;
-+                }
-+                value = 8UL * 1024 * 1024 * 1024;
-+                valueSize = 8;
-+                _ = TryWriteUInt64Compat(ctx, oldp, value);
-+                break;
-+            default:
++            var entropy = new byte[count];
++            RandomNumberGenerator.Fill(entropy);
++            if (!TryWriteCompat(ctx, oldp, entropy))
++            {
 +                ctx[CpuRegister.Rax] = unchecked((ulong)-1);
 +                return -1;
++            }
 +        }
 +
-+        _ = TryWriteUInt64Compat(ctx, oldlenp, valueSize);
++        _ = TryWriteUInt64Compat(ctx, oldlenp, (ulong)count);
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "Wh7HbV7JFqc",
++        ExportName = "getrlimit",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libKernel")]
++    public static int KernelGetrLimit(CpuContext ctx)
++    {
++        var resource = (int)ctx[CpuRegister.Rdi];
++        var limitsAddress = ctx[CpuRegister.Rsi];
++        if (limitsAddress == 0)
++        {
++            ctx[CpuRegister.Rax] = unchecked((ulong)-1);
++            return -1;
++        }
++
++        ulong current = 0x7FFFFFFFFFFFFFFFUL;
++        ulong maximum = 0x7FFFFFFFFFFFFFFFUL;
++        switch (resource)
++        {
++            case 7: // RLIMIT_NOFILE
++                current = 4096;
++                maximum = 4096;
++                break;
++            case 3: // RLIMIT_STACK
++            case 9: // RLIMIT_AS/VMEM
++                current = 64UL * 1024 * 1024;
++                maximum = 512UL * 1024 * 1024;
++                break;
++        }
++
++        if (!TryWriteUInt64Compat(ctx, limitsAddress, current) ||
++            !TryWriteUInt64Compat(ctx, limitsAddress + 8, maximum))
++        {
++            ctx[CpuRegister.Rax] = unchecked((ulong)-1);
++            return -1;
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "4X0QwvuCfjc",
++        ExportName = "setrlimit",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libKernel")]
++    public static int KernelSetrLimit(CpuContext ctx)
++    {
++        // The emulator already reports generous limits from getrlimit; JVM
++        // startup attempts to raise them, which is a harmless no-op here.
 +        ctx[CpuRegister.Rax] = 0;
 +        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
 +    }
  }
-diff --git a/src/SharpEmu.Libs/Kernel/KernelSemaphoreCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelSemaphoreCompatExports.cs
-index bc78809..fe0095f 100644
---- a/src/SharpEmu.Libs/Kernel/KernelSemaphoreCompatExports.cs
-+++ b/src/SharpEmu.Libs/Kernel/KernelSemaphoreCompatExports.cs
-@@ -726,22 +726,12 @@ public static class KernelSemaphoreCompatExports
+diff --git a/src/SharpEmu.Libs/Kernel/KernelModuleRegistry.cs b/src/SharpEmu.Libs/Kernel/KernelModuleRegistry.cs
+index 2cca069..42e527d 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelModuleRegistry.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelModuleRegistry.cs
+@@ -21,6 +21,7 @@ public static class KernelModuleRegistry
+     private static readonly Dictionary<int, ModuleEntry> _modulesByHandle = new();
+     private static readonly Dictionary<int, Dictionary<string, ulong>> _symbolsByHandle = new();
+     private static readonly Dictionary<int, ModuleSegment[]> _segmentsByHandle = new();
++    private static readonly Dictionary<int, IReadOnlyList<ulong>> _initializersByHandle = new();
+     private static readonly Dictionary<string, int> _handleByPath = new(StringComparer.OrdinalIgnoreCase);
+     private static readonly Dictionary<string, int> _handleByName = new(StringComparer.OrdinalIgnoreCase);
+     private static readonly Dictionary<int, int> _sysmoduleHandleById = new();
+@@ -65,6 +66,7 @@ public static class KernelModuleRegistry
+             _modulesByHandle.Clear();
+             _symbolsByHandle.Clear();
+             _segmentsByHandle.Clear();
++            _initializersByHandle.Clear();
+             _handleByPath.Clear();
+             _handleByName.Clear();
+             _sysmoduleHandleById.Clear();
+@@ -260,6 +262,14 @@ public static class KernelModuleRegistry
+         }
+     }
  
-     private static bool TryReadUInt32(CpuContext ctx, ulong address, out uint value)
++    public static IReadOnlyList<int> GetLoadedModuleHandles()
++    {
++        lock (_gate)
++        {
++            return _modulesByHandle.Keys.OrderBy(handle => handle).ToArray();
++        }
++    }
++
+     public static bool TryGetModuleByHandle(int handle, out ModuleEntry module)
      {
--        Span<byte> buffer = stackalloc byte[sizeof(uint)];
--        if (!ctx.Memory.TryRead(address, buffer))
--        {
--            value = 0;
--            return false;
--        }
+         lock (_gate)
+@@ -287,7 +297,9 @@ public static class KernelModuleRegistry
+                 return false;
+             }
+ 
+-            if (module.InitEntryPoint < 0x10000)
++            var hasInitArray = _initializersByHandle.TryGetValue(handle, out var initializers) &&
++                               initializers.Count > 0;
++            if (module.InitEntryPoint < 0x10000 && !hasInitArray)
+             {
+                 module = module with { StartState = ModuleStartState.Started };
+                 _modulesByHandle[handle] = module;
+@@ -378,6 +390,26 @@ public static class KernelModuleRegistry
+         return false;
+     }
+ 
++    public static void RegisterModuleInitializers(int handle, IReadOnlyList<ulong> functions)
++    {
++        ArgumentNullException.ThrowIfNull(functions);
++        lock (_gate)
++        {
++            if (_modulesByHandle.ContainsKey(handle))
++            {
++                _initializersByHandle[handle] = functions.ToArray();
++            }
++        }
++    }
++
++    public static bool TryGetModuleInitializers(int handle, out IReadOnlyList<ulong> functions)
++    {
++        lock (_gate)
++        {
++            return _initializersByHandle.TryGetValue(handle, out functions!);
++        }
++    }
++
+     public static bool TryResolveModuleSymbol(int handle, string symbolName, out ulong address)
+     {
+         address = 0;
+diff --git a/src/SharpEmu.Libs/Kernel/KernelPosixCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelPosixCompatExports.cs
+new file mode 100644
+index 0000000..c3f3773
+--- /dev/null
++++ b/src/SharpEmu.Libs/Kernel/KernelPosixCompatExports.cs
+@@ -0,0 +1,298 @@
++// Copyright (C) 2026 SharpEmu Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++using SharpEmu.HLE;
++using System.Text;
++
++namespace SharpEmu.Libs.Kernel;
++
++/// <summary>
++/// Small POSIX libc shims needed by the bundled Java 25 runtime and LWJGL.
++/// All handlers return ORBIS_GEN2_OK and place the libc result in RAX so the
++/// generic import dispatcher does not leave an ORBIS error code in a pointer
++/// or integer return value.
++/// </summary>
++public static class KernelPosixCompatExports
++{
++    private const int Einval = 22;
++    private const int Efault = 14;
++    private const int Eexist = 17;
++    private const int Enoent = 2;
++    private const int Eperm = 1;
++    private const int Eopnotsupp = 102;
++    private const int MaxStringLength = 4096;
++
++    [SysAbiExport(
++        Nid = "z-7revyudjM",
++        ExportName = "secure_getenv",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixSecureGetenv(CpuContext ctx)
++    {
++        // The title passes its configuration explicitly through launch.conf.
++        // NULL means "not set" and avoids exposing host environment to guests.
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "mkawd0NA9ts",
++        ExportName = "sysconf",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixSysconf(CpuContext ctx)
++    {
++        var name = unchecked((int)ctx[CpuRegister.Rdi]);
++        long value;
++        switch (name)
++        {
++            case 0x1E: // _SC_PAGESIZE
++                value = 0x1000;
++                break;
++            case 0x1F: // _SC_NPROCESSORS_CONF
++            case 0x20: // _SC_NPROCESSORS_ONLN
++                value = System.Environment.ProcessorCount;
++                break;
++            case 0x21: // _SC_PHYS_PAGES (best effort)
++            case 0x22: // _SC_AVPHYS_PAGES (best effort)
++                value = 4096;
++                break;
++            case 0xBC: // _SC_LEVEL1_ICACHE_LINESIZE
++            case 0xBD: // _SC_LEVEL1_DCACHE_LINESIZE
++            case 0xBE: // _SC_LEVEL2_CACHE_LINESIZE
++            case 0xBF: // _SC_LEVEL3_CACHE_LINESIZE
++                value = 0x40;
++                break;
++            default:
++                value = 0;
++                break;
++        }
++
++        ctx[CpuRegister.Rax] = unchecked((ulong)value);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "-nvxBWa0iDs",
++        ExportName = "gethostname",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixGethostname(CpuContext ctx)
++    {
++        var buffer = ctx[CpuRegister.Rdi];
++        var length = ctx[CpuRegister.Rsi];
++        if (buffer == 0 || length == 0)
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
++            ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        var name = "PS5Craft\0"u8;
++        var writeLength = (int)Math.Min((ulong)name.Length, length);
++        if (!ctx.Memory.TryWrite(buffer, name[..writeLength]))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
++            ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "j-gWL6wDros",
++        ExportName = "getifaddrs",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixGetifaddrs(CpuContext ctx)
++    {
++        // Network interface enumeration is not needed for offline Minecraft.
++        // Returning -1 lets callers fall back to the loopback path.
++        KernelRuntimeCompatExports.TrySetErrno(ctx, Eopnotsupp);
++        ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "N2OjwJJGjeQ",
++        ExportName = "freeifaddrs",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixFreeifaddrs(CpuContext ctx)
++    {
++        // Paired with the no-op getifaddrs above.
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "q0F6yS-rCms",
++        ExportName = "strcspn",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixStrcspn(CpuContext ctx)
++    {
++        var source = ctx[CpuRegister.Rdi];
++        var reject = ctx[CpuRegister.Rsi];
++        Span<byte> current = stackalloc byte[1];
++
++        var rejectTable = new bool[256];
++        for (var i = 0; i < MaxStringLength; i++)
++        {
++            if (!ctx.Memory.TryRead(reject + (ulong)i, current))
++            {
++                break;
++            }
++
++            if (current[0] == 0)
++            {
++                break;
++            }
++
++            rejectTable[current[0]] = true;
++        }
++
++        for (var i = 0; i < MaxStringLength; i++)
++        {
++            if (!ctx.Memory.TryRead(source + (ulong)i, current))
++            {
++                ctx[CpuRegister.Rax] = (ulong)i;
++                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            }
++
++            if (current[0] == 0 || rejectTable[current[0]])
++            {
++                ctx[CpuRegister.Rax] = (ulong)i;
++                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            }
++        }
++
++        ctx[CpuRegister.Rax] = MaxStringLength;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "RBcs3uut1TA",
++        ExportName = "strerror_r",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    [SysAbiExport(
++        Nid = "+AGtNVLAXUI",
++        ExportName = "getErrorString",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixStrerrorR(CpuContext ctx)
++    {
++        var errorNumber = unchecked((int)ctx[CpuRegister.Rdi]);
++        var buffer = ctx[CpuRegister.Rsi];
++        var bufferLength = ctx[CpuRegister.Rdx];
++        var text = errorNumber switch
++        {
++            1 => "Operation not permitted",
++            2 => "No such file or directory",
++            9 => "Bad file descriptor",
++            13 => "Permission denied",
++            17 => "File exists",
++            22 => "Invalid argument",
++            _ => $"Unknown error {errorNumber}",
++        };
++
++        if (buffer != 0 && bufferLength != 0)
++        {
++            var bytes = Encoding.ASCII.GetBytes(text + "\0");
++            var writeLength = (int)Math.Min((ulong)bytes.Length, bufferLength);
++            if (!ctx.Memory.TryWrite(buffer, bytes.AsSpan(0, writeLength)))
++            {
++                KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
++                ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++            }
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "JGMio+21L4c",
++        ExportName = "mkdir",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixMkdir(CpuContext ctx)
++    {
++        var result = KernelMemoryCompatExports.KernelMkdir(ctx);
++        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        var errno = result switch
++        {
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_ALREADY_EXISTS => Eexist,
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => Eperm,
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND => Enoent,
++            _ => Einval,
++        };
++        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
++        ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "DRGXpDDh8Ng",
++        ExportName = "lstat",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixLstat(CpuContext ctx) => KernelMemoryCompatExports.PosixStat(ctx);
++
++    [SysAbiExport(
++        Nid = "MZO7FXyAPU8",
++        ExportName = "remove",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixRemove(CpuContext ctx) => KernelMemoryCompatExports.PosixUnlink(ctx);
++
++    [SysAbiExport(
++        Nid = "MZb0GKT3mo8",
++        ExportName = "socketpair",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixSocketpair(CpuContext ctx)
++    {
++        // The bundled SDL/LWJGL natives only probe socketpair during startup.
++        // Fail with a POSIX errno so stale guest registers are not mistaken for
++        // file descriptors.
++        KernelRuntimeCompatExports.TrySetErrno(ctx, Eopnotsupp);
++        ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    // libstdc++ is not shipped with the Java runtime. libSDL3 and libopenal
++    // still import these two one-time C++ static initializers. Their effects
++    // are process-local stream bookkeeping that the HLE console layer already
++    // emulates, so provide ABI-compatible no-ops.
++    [SysAbiExport(
++        Nid = "sqWytnhYdEg",
++        ExportName = "_ZNSt8ios_base4InitC1Ev",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libstdc++")]
++    public static int IosBaseInitConstructor(CpuContext ctx)
++    {
++        ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "vJ5Qdva9B8A",
++        ExportName = "_ZNSt14basic_ofstreamIcSt11char_traitsIcEEC1Ev",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libstdc++")]
++    public static int OfstreamConstructor(CpuContext ctx)
++    {
++        ctx[CpuRegister.Rax] = ctx[CpuRegister.Rdi];
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++}
+diff --git a/src/SharpEmu.Libs/Kernel/KernelPosixMathCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelPosixMathCompatExports.cs
+new file mode 100644
+index 0000000..8795bad
+--- /dev/null
++++ b/src/SharpEmu.Libs/Kernel/KernelPosixMathCompatExports.cs
+@@ -0,0 +1,190 @@
++// Copyright (C) 2026 SharpEmu Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++using SharpEmu.HLE;
++
++namespace SharpEmu.Libs.Kernel;
++
++/// <summary>
++/// POSIX math and scheduler shims used by the bundled LWJGL natives. These
++/// libraries keep plain FreeBSD import names, so the export-name index maps
++/// them onto these canonical NIDs during import setup.
++/// </summary>
++public static class KernelPosixMathCompatExports
++{
++    private const int Enosys = 102;
++
++    [SysAbiExport(
++        Nid = "H8ya2H00jbI",
++        ExportName = "sin",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libm")]
++    public static int PosixSin(CpuContext ctx)
++    {
++        SetXmmDouble(ctx, 0, Math.Sin(GetXmmDouble(ctx, 0)));
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "2WE3BTYVwKM",
++        ExportName = "cos",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libm")]
++    public static int PosixCos(CpuContext ctx)
++    {
++        SetXmmDouble(ctx, 0, Math.Cos(GetXmmDouble(ctx, 0)));
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "jMB7EFyu30Y",
++        ExportName = "sincos",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libm")]
++    public static int PosixSinCos(CpuContext ctx)
++    {
++        var value = GetXmmDouble(ctx, 0);
++        var sinAddress = ctx[CpuRegister.Rdi];
++        var cosAddress = ctx[CpuRegister.Rsi];
++        if (sinAddress != 0)
++            _ = ctx.Memory.TryWrite(sinAddress, BitConverter.GetBytes(Math.Sin(value)));
++        if (cosAddress != 0)
++            _ = ctx.Memory.TryWrite(cosAddress, BitConverter.GetBytes(Math.Cos(value)));
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "TYE4irxSmko",
++        ExportName = "toupper",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixToupper(CpuContext ctx)
++    {
++        var value = unchecked((int)ctx[CpuRegister.Rdi]);
++        if (value is >= 'a' and <= 'z')
++            value -= 'a' - 'A';
++        ctx[CpuRegister.Rax] = unchecked((ulong)(uint)value);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "Jahsnh4KKkg",
++        ExportName = "madvise",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixMadvise(CpuContext ctx)
++    {
++        // Guest mappings are host-backed and committed up front, so the advice
++        // is advisory only. Return POSIX success instead of an ORBIS error.
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "LBQrZ9dSuqI",
++        ExportName = "sched_getaffinity",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixSchedGetaffinity(CpuContext ctx)
++    {
++        var maskAddress = ctx[CpuRegister.Rdx];
++        var maskSize = (int)Math.Min(ctx[CpuRegister.Rsi], 4096);
++        if (maskAddress == 0 || maskSize == 0)
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, 22);
++            ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        var mask = new byte[maskSize];
++        var cpuCount = Math.Min(Environment.ProcessorCount, maskSize * 8);
++        for (var cpu = 0; cpu < cpuCount; cpu++)
++            mask[cpu / 8] |= (byte)(1 << (cpu % 8));
++
++        if (!ctx.Memory.TryWrite(maskAddress, mask))
++        {
++            KernelRuntimeCompatExports.TrySetErrno(ctx, 14);
++            ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "NYlzGdLko7I",
++        ExportName = "__sched_cpucount",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixSchedCpuCount(CpuContext ctx)
++    {
++        var maskAddress = ctx[CpuRegister.Rsi];
++        var maskSize = (int)Math.Min(ctx[CpuRegister.Rdi], 4096);
++        if (maskAddress == 0 || maskSize == 0)
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        var mask = new byte[maskSize];
++        if (!ctx.Memory.TryRead(maskAddress, mask))
++        {
++            ctx[CpuRegister.Rax] = 0;
++            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++        }
++
++        var count = 0;
++        foreach (var value in mask)
++        {
++            var current = value;
++            while (current != 0)
++            {
++                count += current & 1;
++                current >>= 1;
++            }
++        }
++
++        ctx[CpuRegister.Rax] = (ulong)count;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "voppQS6Gtuk",
++        ExportName = "__register_atfork",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixRegisterAtfork(CpuContext ctx)
++    {
++        // Guest threads are cooperatively scheduled and never fork the host.
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    [SysAbiExport(
++        Nid = "-Jp7F+pXxNg",
++        ExportName = "pipe",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixPipe(CpuContext ctx)
++    {
++        // No anonymous host pipe bridge is exposed to the guest yet. Report a
++        // normal POSIX failure instead of leaving an ORBIS error in the fd out
++        // parameters.
++        KernelRuntimeCompatExports.TrySetErrno(ctx, Enosys);
++        ctx[CpuRegister.Rax] = unchecked((ulong)(long)-1);
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
++    private static double GetXmmDouble(CpuContext ctx, int registerIndex)
++    {
++        ctx.GetXmmRegister(registerIndex, out var bits, out _);
++        return BitConverter.Int64BitsToDouble(unchecked((long)bits));
++    }
++
++    private static void SetXmmDouble(CpuContext ctx, int registerIndex, double value)
++    {
++        var bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(value));
++        ctx.SetXmmRegister(registerIndex, bits, 0);
++    }
++}
+diff --git a/src/SharpEmu.Libs/Kernel/KernelPthreadCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelPthreadCompatExports.cs
+index 63041c6..0b42b4a 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelPthreadCompatExports.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelPthreadCompatExports.cs
+@@ -262,6 +262,17 @@ public static class KernelPthreadCompatExports
+         LibraryName = "libKernel")]
+     public static int PosixPthreadSelf(CpuContext ctx) => PthreadSelf(ctx);
+ 
++    [SysAbiExport(
++        Nid = "oxMp8uPqa+U",
++        ExportName = "pthread_set_name_np",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
++    public static int PosixPthreadSetNameNp(CpuContext ctx)
++    {
++        ctx[CpuRegister.Rax] = 0;
++        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
++    }
++
+     [SysAbiExport(
+         Nid = "3PtV6p3QNX4",
+         ExportName = "scePthreadEqual",
+@@ -398,35 +409,63 @@ public static class KernelPthreadCompatExports
+         ExportName = "pthread_mutex_init",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PosixPthreadMutexInit(CpuContext ctx) => PthreadMutexInitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi]);
++    public static int PosixPthreadMutexInit(CpuContext ctx) => MapPosixMutexResult(ctx,
++        PthreadMutexInitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi]));
+ 
+     [SysAbiExport(
+         Nid = "ltCfaGr2JGE",
+         ExportName = "pthread_mutex_destroy",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PosixPthreadMutexDestroy(CpuContext ctx) => PthreadMutexDestroyCore(ctx, ctx[CpuRegister.Rdi]);
++    public static int PosixPthreadMutexDestroy(CpuContext ctx) => MapPosixMutexResult(ctx,
++        PthreadMutexDestroyCore(ctx, ctx[CpuRegister.Rdi]));
+ 
+     [SysAbiExport(
+         Nid = "7H0iTOciTLo",
+         ExportName = "pthread_mutex_lock",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PosixPthreadMutexLock(CpuContext ctx) => PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: false);
++    public static int PosixPthreadMutexLock(CpuContext ctx) => MapPosixMutexResult(ctx,
++        PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: false));
+ 
+     [SysAbiExport(
+         Nid = "K-jXhbt2gn4",
+         ExportName = "pthread_mutex_trylock",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PosixPthreadMutexTrylock(CpuContext ctx) => PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: true);
++    public static int PosixPthreadMutexTrylock(CpuContext ctx) => MapPosixMutexResult(ctx,
++        PthreadMutexLockCore(ctx, ctx[CpuRegister.Rdi], tryOnly: true));
+ 
+     [SysAbiExport(
+         Nid = "2Z+PpY6CaJg",
+         ExportName = "pthread_mutex_unlock",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PosixPthreadMutexUnlock(CpuContext ctx) => PthreadMutexUnlockCore(ctx, ctx[CpuRegister.Rdi], requireOwner: true);
++    public static int PosixPthreadMutexUnlock(CpuContext ctx) => MapPosixMutexResult(ctx,
++        PthreadMutexUnlockCore(ctx, ctx[CpuRegister.Rdi], requireOwner: true));
++
++    private static int MapPosixMutexResult(CpuContext ctx, int result)
++    {
++        // POSIX pthread_mutex_* calls return an errno value directly. The HLE core
++        // speaks in ORBIS kernel result codes, so translate the cases HotSpot checks.
++        var mapped = result switch
++        {
++            (int)OrbisGen2Result.ORBIS_GEN2_OK => 0,
++            // HotSpot's BSD port compares against the FreeBSD errno values.
++            // ORBIS result codes are not errno values, so translate them to the
++            // same constants the prebuilt JVM expects (notably EBUSY == 16).
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY => 16,      // EBUSY
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK => 11,  // EDEADLK
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT => 60, // ETIMEDOUT
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => 22, // EINVAL
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND => 22, // EINVAL
++            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => 1, // EPERM
++            < 0 => 22,
++            _ => result,
++        };
++        ctx[CpuRegister.Rax] = unchecked((ulong)mapped);
++        return mapped;
++    }
+ 
+     private static int PthreadGetthreadidCore(CpuContext ctx)
+     {
+diff --git a/src/SharpEmu.Libs/Kernel/KernelPthreadExtendedCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelPthreadExtendedCompatExports.cs
+index e85d82e..e7d1ce2 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelPthreadExtendedCompatExports.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelPthreadExtendedCompatExports.cs
+@@ -584,7 +584,6 @@ public static class KernelPthreadExtendedCompatExports
+ 			}
+             _attrStates[outAttrAddress] = threadState.Attributes;
+         }
 -
--        value = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
--        return true;
-+        return KernelMemoryCompatExports.TryReadUInt32Compat(ctx, address, out value);
+         ctx[CpuRegister.Rax] = 0;
+         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+     }
+@@ -2070,7 +2069,15 @@ public static class KernelPthreadExtendedCompatExports
+         ExportName = "pthread_attr_getstacksize",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+-    public static int PthreadAttrGetstacksizePOSIX(CpuContext ctx) => PthreadAttrGetstacksize(ctx);
++    public static int PthreadAttrGetstacksizePOSIX(CpuContext ctx)
++    {
++        var result = PthreadAttrGetstacksize(ctx);
++        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
++        {
++            ctx[CpuRegister.Rax] = 0;
++        }
++        return result;
++    }
+ 
+     [SysAbiExport(
+         Nid = "VUT1ZSrHT0I",
+@@ -2092,4 +2099,21 @@ public static class KernelPthreadExtendedCompatExports
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
+     public static int PthreadAttrGetguardsizePOSIX(CpuContext ctx) => PthreadAttrGetguardsize(ctx);
++
++    // HotSpot's BSD stack discovery calls the deprecated POSIX alias. The sce*
++    // variant returns the stack address in RAX, but POSIX callers expect 0 on
++    // success and read the address from the out pointer.
++    [SysAbiExport(
++        Nid = "DxmIMUQ-wXY",
++        ExportName = "pthread_attr_getstackaddr",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libKernel")]
++    public static int PthreadAttrGetstackaddrPOSIX(CpuContext ctx)
++    {
++        var result = PthreadAttrGetstackaddr(ctx);        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
++        {
++            ctx[CpuRegister.Rax] = 0;
++        }
++        return result;
++    }
+ }
+diff --git a/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.Signals.cs b/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.Signals.cs
+index 83a91cd..11dd1b7 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.Signals.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.Signals.cs
+@@ -42,6 +42,55 @@ public static partial class KernelRuntimeCompatExports
+         return ctx.SetReturn(0);
      }
  
-     private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
++    [SysAbiExport(Nid = "JZKw5+Wrnaw", ExportName = "pthread_sigmask", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libc")]
++    public static int PosixPthreadSigmask(CpuContext ctx)
++    {
++        var how = (int)ctx[CpuRegister.Rdi];
++        var source = ctx[CpuRegister.Rsi];
++        var output = ctx[CpuRegister.Rdx];
++        if (how is < 1 or > 3)
++        {
++            return SignalMaskFailure(ctx, 22);
++        }
++
++        ulong requestedLow = 0;
++        ulong requestedHigh = 0;
++        if (source != 0 &&
++            (!KernelMemoryCompatExports.TryReadUInt64Compat(ctx, source, out requestedLow) ||
++             !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, source + 8, out requestedHigh)))
++        {
++            return SignalMaskFailure(ctx, 14);
++        }
++
++        var mask = _posixSignalMask ??= new byte[16];
++        if (source != 0)
++        {
++            Span<byte> requested = stackalloc byte[16];
++            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(requested, requestedLow);
++            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(requested[8..], requestedHigh);
++            for (var i = 0; i < mask.Length; i++)
++            {
++                mask[i] = how switch
++                {
++                    1 => (byte)(mask[i] | requested[i]),
++                    2 => (byte)(mask[i] & ~requested[i]),
++                    _ => requested[i],
++                };
++            }
++        }
++
++        if (output != 0 &&
++            (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, output,
++                 System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(mask)) ||
++             !KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, output + 8,
++                 System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(mask.AsSpan(8)))))
++        {
++            return SignalMaskFailure(ctx, 14);
++        }
++
++        return ctx.SetReturn(0);
++    }
++
+     private static int SignalMaskFailure(CpuContext ctx, int errno)
      {
--        Span<byte> buffer = stackalloc byte[sizeof(uint)];
--        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
--        return ctx.Memory.TryWrite(address, buffer);
-+        return KernelMemoryCompatExports.TryWriteUInt32Compat(ctx, address, value);
-     }
+         _ = TrySetErrno(ctx, errno);
+diff --git a/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.cs b/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.cs
+index 5806192..89265db 100644
+--- a/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.cs
++++ b/src/SharpEmu.Libs/Kernel/KernelRuntimeCompatExports.cs
+@@ -135,6 +135,8 @@ public static partial class KernelRuntimeCompatExports
  
-     private static bool TryReadNullTerminatedUtf8(CpuContext ctx, ulong address, int maxLength, out string value)
+     [SysAbiExport(Nid = "-ZR+hG7aDHw", ExportName = "sceKernelSleep",
+         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
++    [SysAbiExport(Nid = "0wu33hunNdE", ExportName = "sleep",
++        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+     public static int KernelSleep(CpuContext ctx)
+     {
+         var remaining = (ulong)(uint)ctx[CpuRegister.Rdi] * 1000;
+@@ -673,6 +675,11 @@ public static partial class KernelRuntimeCompatExports
+         ExportName = "__error",
+         Target = Generation.Gen4 | Generation.Gen5,
+         LibraryName = "libKernel")]
++    [SysAbiExport(
++        Nid = "ArhJ8egVeAM",
++        ExportName = "__errno_location",
++        Target = Generation.Gen4 | Generation.Gen5,
++        LibraryName = "libc")]
+     public static int ErrorAddress(CpuContext ctx)
+     {
+         var address = GetTlsScratchAddress(ctx, TlsErrnoOffset);
+@@ -1198,7 +1205,6 @@ public static partial class KernelRuntimeCompatExports
+                 ctx,
+                 (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+         }
+-
+         int handle;
+         var hasDirectory = modulePath.Contains('/') || modulePath.Contains('\\');
+         var isApp0Path = modulePath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) ||
+@@ -1231,25 +1237,57 @@ public static partial class KernelRuntimeCompatExports
+         if (KernelModuleRegistry.TryBeginModuleStart(handle, out var moduleToStart))
+         {
+             var scheduler = GuestThreadExecution.Scheduler;
+-            string? startError = null;
+             ulong startResult = 0;
+-            var started = scheduler is not null && scheduler.TryCallGuestFunction(
+-                ctx,
+-                moduleToStart.InitEntryPoint,
+-                argumentSize,
+-                argumentAddress,
+-                0,
+-                0,
+-                0,
+-                $"sceKernelLoadStartModule:{moduleToStart.Name}",
+-                out startResult,
+-                out startError);
++            var started = true;
++
++            if (moduleToStart.InitEntryPoint >= 0x10000)
++            {
++                started = scheduler is not null && scheduler.TryCallGuestFunction(
++                    ctx,
++                    moduleToStart.InitEntryPoint,
++                    argumentSize,
++                    argumentAddress,
++                    0,
++                    0,
++                    0,
++                    $"sceKernelLoadStartModule:{moduleToStart.Name}",
++                    out startResult,
++                    out _);
++            }
++
++            if (started &&
++                KernelModuleRegistry.TryGetModuleInitializers(handle, out var initializers) &&
++                initializers.Count > 0)
++            {
++                for (var i = 0; i < initializers.Count; i++)
++                {
++                    var initializerAddress = initializers[i];
++                    if (initializerAddress < 0x10000)
++                    {
++                        continue;
++                    }
++
++                    started = scheduler is not null && scheduler.TryCallGuestFunction(
++                        ctx,
++                        initializerAddress,
++                        0,
++                        0,
++                        0,
++                        0,
++                        0,
++                        $"sceKernelLoadStartModule:{moduleToStart.Name}:init_array[{i}]",
++                        out startResult,
++                        out _);
++                    if (!started)
++                    {
++                        break;
++                    }
++                }
++            }
++
+             KernelModuleRegistry.CompleteModuleStart(handle, started);
+             if (!started)
+             {
+-                Console.Error.WriteLine(
+-                    $"[LOADER][ERROR] sceKernelLoadStartModule failed to start '{moduleToStart.Name}' " +
+-                    $"at 0x{moduleToStart.InitEntryPoint:X16}: {startError ?? "guest scheduler unavailable"}");
+                 return ReturnModuleLoadError(
+                     ctx,
+                     (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP);
+@@ -1261,10 +1299,6 @@ public static partial class KernelRuntimeCompatExports
+                     ctx,
+                     (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+             }
+-
+-            Console.Error.WriteLine(
+-                $"[LOADER][INFO] sceKernelLoadStartModule started '{moduleToStart.Name}' " +
+-                $"at 0x{moduleToStart.InitEntryPoint:X16}");
+         }
+ 
+         ctx[CpuRegister.Rax] = unchecked((uint)handle);
+@@ -1774,9 +1808,19 @@ public static partial class KernelRuntimeCompatExports
+         Span<byte> one = stackalloc byte[1];
+         for (var i = 0; i < maxLength; i++)
+         {
+-            if (!ctx.Memory.TryRead(address + (ulong)i, one))
++            var current = address + (ulong)i;
++            if (!ctx.Memory.TryRead(current, one))
+             {
+-                return false;
++                // JNI string buffers come from the HLE allocator and live in
++                // host memory, so fall back to a guarded host-pointer read.
++                try
++                {
++                    one[0] = Marshal.ReadByte((nint)current);
++                }
++                catch
++                {
++                    return false;
++                }
+             }
+ 
+             if (one[0] == 0)

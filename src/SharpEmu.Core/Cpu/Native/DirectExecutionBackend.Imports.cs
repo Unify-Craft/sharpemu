@@ -433,7 +433,11 @@ public sealed partial class DirectExecutionBackend
 		ulong num7 = *(ulong*)(argPackPtr + 96);
 		var probeTarget = _probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress;
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
-		if (!IsLikelyReturnAddress(num7))
+		// Low guest code addresses are valid for this title: libjvm is mapped at
+		// 0x02000000. The generic heuristic assumes Gen5 code lives at >=
+		// 0x300000000, so consult the guest's executable regions before treating
+		// such a return address as corrupt.
+		if (!IsLikelyReturnAddress(num7) && !IsDirectImportTargetUsable(num7))
 		{
 			for (int i = 1; i <= 4; i++)
 			{
@@ -722,6 +726,14 @@ public sealed partial class DirectExecutionBackend
 					string.Equals(importStubEntry.Nid, "LwG8g3niqwA", StringComparison.Ordinal))
 				{
 					orbisGen2Result = DispatchKernelDynlibDlsym();
+				}
+				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.Ps5CraftDlopen, StringComparison.Ordinal))
+				{
+					orbisGen2Result = DispatchPs5CraftDlopen();
+				}
+				else if (string.Equals(importStubEntry.Nid, RuntimeStubNids.Ps5CraftDlsym, StringComparison.Ordinal))
+				{
+					orbisGen2Result = DispatchPs5CraftDlsym();
 				}
 				else if (string.Equals(importStubEntry.Nid, "r8mvOaWdi28", StringComparison.Ordinal))
 				{
@@ -2471,6 +2483,102 @@ public sealed partial class DirectExecutionBackend
 			num *= 1099511628211uL;
 		}
 		return num;
+	}
+
+	private const ulong Ps5CraftGlobalDlopenHandle = 0x7F5C000000000001UL;
+
+	private OrbisGen2Result DispatchPs5CraftDlopen()
+	{
+		var cpuContext = ActiveCpuContext;
+		if (cpuContext == null)
+		{
+			return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+		}
+
+		var pathAddress = cpuContext[CpuRegister.Rdi];
+		if (pathAddress == 0)
+		{
+			// POSIX dlopen(NULL, ...) asks for a process-wide lookup handle.
+			cpuContext[CpuRegister.Rax] = Ps5CraftGlobalDlopenHandle;
+			return OrbisGen2Result.ORBIS_GEN2_OK;
+		}
+
+		if (!TryReadAsciiZ(pathAddress, 512, out var modulePath) ||
+			string.IsNullOrWhiteSpace(modulePath))
+		{
+			cpuContext[CpuRegister.Rax] = 0;
+			return OrbisGen2Result.ORBIS_GEN2_OK;
+		}
+
+		var savedRsi = cpuContext[CpuRegister.Rsi];
+		var savedRdx = cpuContext[CpuRegister.Rdx];
+		var savedRcx = cpuContext[CpuRegister.Rcx];
+		var savedR8 = cpuContext[CpuRegister.R8];
+		var savedR9 = cpuContext[CpuRegister.R9];
+		cpuContext[CpuRegister.Rsi] = 0;
+		cpuContext[CpuRegister.Rdx] = 0;
+		cpuContext[CpuRegister.Rcx] = 0;
+		cpuContext[CpuRegister.R8] = 0;
+		cpuContext[CpuRegister.R9] = 0;
+		var loadStatus = KernelRuntimeCompatExports.KernelLoadStartModule(cpuContext);
+		var handle = cpuContext[CpuRegister.Rax];
+		cpuContext[CpuRegister.Rsi] = savedRsi;
+		cpuContext[CpuRegister.Rdx] = savedRdx;
+		cpuContext[CpuRegister.Rcx] = savedRcx;
+		cpuContext[CpuRegister.R8] = savedR8;
+		cpuContext[CpuRegister.R9] = savedR9;
+
+		if (loadStatus != (int)OrbisGen2Result.ORBIS_GEN2_OK || handle == 0 || unchecked((long)handle) < 0)
+		{
+			handle = 0;
+		}
+		cpuContext[CpuRegister.Rax] = handle;
+		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	private OrbisGen2Result DispatchPs5CraftDlsym()
+	{
+		var cpuContext = ActiveCpuContext;
+		if (cpuContext == null)
+		{
+			return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+		}
+
+		var moduleHandleValue = cpuContext[CpuRegister.Rdi];
+		if (!TryReadAsciiZ(cpuContext[CpuRegister.Rsi], 512, out var symbolName) ||
+			string.IsNullOrWhiteSpace(symbolName))
+		{
+			cpuContext[CpuRegister.Rax] = 0;
+			return OrbisGen2Result.ORBIS_GEN2_OK;
+		}
+
+		ulong resolvedAddress = 0;
+		if (moduleHandleValue == 0 || moduleHandleValue == Ps5CraftGlobalDlopenHandle)
+		{
+			foreach (var candidateHandle in KernelModuleRegistry.GetLoadedModuleHandles())
+			{
+				if (TryResolveModuleSymbolAddress(candidateHandle, symbolName, out resolvedAddress))
+				{
+					break;
+				}
+			}
+			if (resolvedAddress == 0)
+			{
+				_ = TryResolveRuntimeSymbolAddress(symbolName, out resolvedAddress) ||
+					TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) ||
+					TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress);
+			}
+		}
+		else
+		{
+			var moduleHandle = unchecked((int)moduleHandleValue);
+			_ = TryResolveModuleSymbolAddress(moduleHandle, symbolName, out resolvedAddress) ||
+				TryResolveRuntimeSymbolAddress(symbolName, out resolvedAddress) ||
+				TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) ||
+				TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress);
+		}
+		cpuContext[CpuRegister.Rax] = resolvedAddress;
+		return OrbisGen2Result.ORBIS_GEN2_OK;
 	}
 
 	private OrbisGen2Result DispatchKernelDynlibDlsym()

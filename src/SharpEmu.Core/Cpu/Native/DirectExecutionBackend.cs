@@ -1328,9 +1328,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		int num = 0;
 		int num2 = 0;
 		int num3 = 0;
-		foreach (var (num4, text2) in importStubs)
+		foreach (var importStub in importStubs)
 		{
+			var num4 = importStub.Key;
+			var text2 = importStub.Value;
 			_ = _moduleManager.TryGetExport(text2, out var resolvedExport);
+			if (resolvedExport is null &&
+				_moduleManager.TryGetExportByName(text2, out var namedExport))
+			{
+				// Some bundled JDK libraries still import plain FreeBSD names.
+				// Resolve them through the HLE export-name index and use the
+				// canonical NID for the rest of the import machinery.
+				resolvedExport = namedExport;
+				text2 = namedExport.Nid;
+			}
 			_importEntries[num] = new ImportStubEntry(
 				num4,
 				text2,
@@ -1430,6 +1441,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					var (address, nid) = additionalStubs[i];
 					_ = _moduleManager.TryGetExport(nid, out var resolvedExport);
+					if (resolvedExport is null &&
+						_moduleManager.TryGetExportByName(nid, out var namedExport))
+					{
+						resolvedExport = namedExport;
+						nid = namedExport.Nid;
+					}
+
 					combinedEntries[currentEntries.Length + i] = new ImportStubEntry(
 						address,
 						nid,
@@ -1783,7 +1801,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		targetAddress = 0uL;
 		resolvedSymbol = string.Empty;
-		if (string.IsNullOrWhiteSpace(nid) || string.Equals(nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal))
+		if (string.IsNullOrWhiteSpace(nid) ||
+			string.Equals(nid, RuntimeStubNids.KernelDynlibDlsym, StringComparison.Ordinal) ||
+			string.Equals(nid, RuntimeStubNids.Ps5CraftDlopen, StringComparison.Ordinal) ||
+			string.Equals(nid, RuntimeStubNids.Ps5CraftDlsym, StringComparison.Ordinal))
 		{
 			return false;
 		}

@@ -584,7 +584,6 @@ public static class KernelPthreadExtendedCompatExports
 			}
             _attrStates[outAttrAddress] = threadState.Attributes;
         }
-
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -2070,7 +2069,15 @@ public static class KernelPthreadExtendedCompatExports
         ExportName = "pthread_attr_getstacksize",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int PthreadAttrGetstacksizePOSIX(CpuContext ctx) => PthreadAttrGetstacksize(ctx);
+    public static int PthreadAttrGetstacksizePOSIX(CpuContext ctx)
+    {
+        var result = PthreadAttrGetstacksize(ctx);
+        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            ctx[CpuRegister.Rax] = 0;
+        }
+        return result;
+    }
 
     [SysAbiExport(
         Nid = "VUT1ZSrHT0I",
@@ -2092,4 +2099,21 @@ public static class KernelPthreadExtendedCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PthreadAttrGetguardsizePOSIX(CpuContext ctx) => PthreadAttrGetguardsize(ctx);
+
+    // HotSpot's BSD stack discovery calls the deprecated POSIX alias. The sce*
+    // variant returns the stack address in RAX, but POSIX callers expect 0 on
+    // success and read the address from the out pointer.
+    [SysAbiExport(
+        Nid = "DxmIMUQ-wXY",
+        ExportName = "pthread_attr_getstackaddr",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrGetstackaddrPOSIX(CpuContext ctx)
+    {
+        var result = PthreadAttrGetstackaddr(ctx);        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            ctx[CpuRegister.Rax] = 0;
+        }
+        return result;
+    }
 }

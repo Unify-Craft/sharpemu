@@ -135,6 +135,8 @@ public static partial class KernelRuntimeCompatExports
 
     [SysAbiExport(Nid = "-ZR+hG7aDHw", ExportName = "sceKernelSleep",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    [SysAbiExport(Nid = "0wu33hunNdE", ExportName = "sleep",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelSleep(CpuContext ctx)
     {
         var remaining = (ulong)(uint)ctx[CpuRegister.Rdi] * 1000;
@@ -673,6 +675,11 @@ public static partial class KernelRuntimeCompatExports
         ExportName = "__error",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
+    [SysAbiExport(
+        Nid = "ArhJ8egVeAM",
+        ExportName = "__errno_location",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
     public static int ErrorAddress(CpuContext ctx)
     {
         var address = GetTlsScratchAddress(ctx, TlsErrnoOffset);
@@ -1198,7 +1205,6 @@ public static partial class KernelRuntimeCompatExports
                 ctx,
                 (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
-
         int handle;
         var hasDirectory = modulePath.Contains('/') || modulePath.Contains('\\');
         var isApp0Path = modulePath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) ||
@@ -1231,25 +1237,57 @@ public static partial class KernelRuntimeCompatExports
         if (KernelModuleRegistry.TryBeginModuleStart(handle, out var moduleToStart))
         {
             var scheduler = GuestThreadExecution.Scheduler;
-            string? startError = null;
             ulong startResult = 0;
-            var started = scheduler is not null && scheduler.TryCallGuestFunction(
-                ctx,
-                moduleToStart.InitEntryPoint,
-                argumentSize,
-                argumentAddress,
-                0,
-                0,
-                0,
-                $"sceKernelLoadStartModule:{moduleToStart.Name}",
-                out startResult,
-                out startError);
+            var started = true;
+
+            if (moduleToStart.InitEntryPoint >= 0x10000)
+            {
+                started = scheduler is not null && scheduler.TryCallGuestFunction(
+                    ctx,
+                    moduleToStart.InitEntryPoint,
+                    argumentSize,
+                    argumentAddress,
+                    0,
+                    0,
+                    0,
+                    $"sceKernelLoadStartModule:{moduleToStart.Name}",
+                    out startResult,
+                    out _);
+            }
+
+            if (started &&
+                KernelModuleRegistry.TryGetModuleInitializers(handle, out var initializers) &&
+                initializers.Count > 0)
+            {
+                for (var i = 0; i < initializers.Count; i++)
+                {
+                    var initializerAddress = initializers[i];
+                    if (initializerAddress < 0x10000)
+                    {
+                        continue;
+                    }
+
+                    started = scheduler is not null && scheduler.TryCallGuestFunction(
+                        ctx,
+                        initializerAddress,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        $"sceKernelLoadStartModule:{moduleToStart.Name}:init_array[{i}]",
+                        out startResult,
+                        out _);
+                    if (!started)
+                    {
+                        break;
+                    }
+                }
+            }
+
             KernelModuleRegistry.CompleteModuleStart(handle, started);
             if (!started)
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][ERROR] sceKernelLoadStartModule failed to start '{moduleToStart.Name}' " +
-                    $"at 0x{moduleToStart.InitEntryPoint:X16}: {startError ?? "guest scheduler unavailable"}");
                 return ReturnModuleLoadError(
                     ctx,
                     (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP);
@@ -1261,10 +1299,6 @@ public static partial class KernelRuntimeCompatExports
                     ctx,
                     (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
-
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] sceKernelLoadStartModule started '{moduleToStart.Name}' " +
-                $"at 0x{moduleToStart.InitEntryPoint:X16}");
         }
 
         ctx[CpuRegister.Rax] = unchecked((uint)handle);
@@ -1774,9 +1808,19 @@ public static partial class KernelRuntimeCompatExports
         Span<byte> one = stackalloc byte[1];
         for (var i = 0; i < maxLength; i++)
         {
-            if (!ctx.Memory.TryRead(address + (ulong)i, one))
+            var current = address + (ulong)i;
+            if (!ctx.Memory.TryRead(current, one))
             {
-                return false;
+                // JNI string buffers come from the HLE allocator and live in
+                // host memory, so fall back to a guarded host-pointer read.
+                try
+                {
+                    one[0] = Marshal.ReadByte((nint)current);
+                }
+                catch
+                {
+                    return false;
+                }
             }
 
             if (one[0] == 0)

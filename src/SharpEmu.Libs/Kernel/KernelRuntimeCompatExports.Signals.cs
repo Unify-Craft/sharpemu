@@ -42,6 +42,55 @@ public static partial class KernelRuntimeCompatExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(Nid = "JZKw5+Wrnaw", ExportName = "pthread_sigmask", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libc")]
+    public static int PosixPthreadSigmask(CpuContext ctx)
+    {
+        var how = (int)ctx[CpuRegister.Rdi];
+        var source = ctx[CpuRegister.Rsi];
+        var output = ctx[CpuRegister.Rdx];
+        if (how is < 1 or > 3)
+        {
+            return SignalMaskFailure(ctx, 22);
+        }
+
+        ulong requestedLow = 0;
+        ulong requestedHigh = 0;
+        if (source != 0 &&
+            (!KernelMemoryCompatExports.TryReadUInt64Compat(ctx, source, out requestedLow) ||
+             !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, source + 8, out requestedHigh)))
+        {
+            return SignalMaskFailure(ctx, 14);
+        }
+
+        var mask = _posixSignalMask ??= new byte[16];
+        if (source != 0)
+        {
+            Span<byte> requested = stackalloc byte[16];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(requested, requestedLow);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(requested[8..], requestedHigh);
+            for (var i = 0; i < mask.Length; i++)
+            {
+                mask[i] = how switch
+                {
+                    1 => (byte)(mask[i] | requested[i]),
+                    2 => (byte)(mask[i] & ~requested[i]),
+                    _ => requested[i],
+                };
+            }
+        }
+
+        if (output != 0 &&
+            (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, output,
+                 System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(mask)) ||
+             !KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, output + 8,
+                 System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(mask.AsSpan(8)))))
+        {
+            return SignalMaskFailure(ctx, 14);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
     private static int SignalMaskFailure(CpuContext ctx, int errno)
     {
         _ = TrySetErrno(ctx, errno);
