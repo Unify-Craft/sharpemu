@@ -1,0 +1,189 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using System.Threading;
+using Iced.Intel;
+using SharpEmu.Core.Cpu.Emulation;
+
+namespace SharpEmu.Core.Cpu.Native;
+
+// Recover supported instructions only after an illegal-instruction fault.
+// Leave native instructions and unrelated register values unchanged.
+public sealed partial class DirectExecutionBackend
+{
+    // Byte offset of Xmm0 within the Win64 CONTEXT record: FltSave (the XMM_SAVE_AREA32/FXSAVE
+    // image) starts right after Rip at offset 256, and XmmRegisters[0] sits 160 bytes into that
+    // area (32-byte header + 8 legacy x87/MMX slots x 16 bytes). 256 + 160 = 416 (0x1A0). Cross-
+    // checked against this file's own Win64ContextSize (0x4D0): rebuilding the whole CONTEXT
+    // layout field-by-field from offset 0 lands on the same 0x4D0 total, which would not happen
+    // if this offset (or anything before it) were wrong.
+    private const int Win64ContextXmm0Offset = 0x1A0;
+
+    private static int _sse4aSoftwareFallbackAnnounced;
+    private static long _sse4aInstructionsEmulated;
+    private static int _monitorxSoftwareFallbackAnnounced;
+    private static long _monitorxInstructionsEmulated;
+
+    private unsafe bool TryRecoverAmdCompatInstruction(void* contextRecord, ulong rip)
+    {
+        if (TryRecoverMonitorxMwaitx(contextRecord, rip))
+        {
+            return true;
+        }
+
+        // EXTRQ and INSERTQ need the current vector register values.
+        // Use recovery only when the signal context contains these values.
+        return (OperatingSystem.IsWindows() || _posixXmmContextBridged) &&
+            TryRecoverSse4aExtractInsert(contextRecord, rip);
+    }
+
+    private unsafe bool TryRecoverMonitorxMwaitx(void* contextRecord, ulong rip)
+    {
+        // MONITORX (0F 01 FA) and MWAITX (0F 01 FB) are fixed 3-byte encodings with no
+        // ModRM/SIB/displacement/immediate, so a raw byte compare is sufficient and unambiguous.
+        var opcode = new byte[3];
+        if (!TryReadExecutableBytes(rip, opcode) ||
+            opcode[0] != 0x0F || opcode[1] != 0x01 || (opcode[2] != 0xFA && opcode[2] != 0xFB))
+        {
+            return false;
+        }
+
+        // PS5 titles use this pair in idle/wait loops: MONITORX arms a monitor on a cache line
+        // and MWAITX blocks until that line is written (or a timeout elapses). Hosts without
+        // the extension raise #UD on either one. We do not model the monitor itself, only its
+        // observable effect on guest forward progress: MONITORX becomes a no-op (arming a
+        // watch we never honour has no side effect of its own) and MWAITX becomes a plain
+        // thread yield, i.e. treat the awaited condition as already satisfied so the guest
+        // loop keeps making progress instead of executing an illegal opcode forever.
+        if (opcode[2] == 0xFB)
+        {
+            Thread.Yield();
+        }
+
+        WriteCtxU64(contextRecord, CTX_RIP, rip + 3);
+
+        Interlocked.Increment(ref _monitorxInstructionsEmulated);
+        if (Interlocked.Exchange(ref _monitorxSoftwareFallbackAnnounced, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][INFO] Host lacks AMD MONITORX/MWAITX used by the guest; " +
+                "emulating those instructions in software.");
+        }
+
+        return true;
+    }
+
+    private unsafe bool TryRecoverSse4aExtractInsert(void* contextRecord, ulong rip)
+    {
+        if (!OperatingSystem.IsWindows() && !_posixXmmContextBridged ||
+            !TryReadFaultingInstruction(rip, out var instruction))
+        {
+            return false;
+        }
+
+        var isExtrq = instruction.Mnemonic == Mnemonic.Extrq;
+        var isInsertq = instruction.Mnemonic == Mnemonic.Insertq;
+        if (!isExtrq && !isInsertq)
+        {
+            return false;
+        }
+
+        var isImmediateExtrq = isExtrq && instruction.OpCount == 3;
+        var isRegisterExtrq = isExtrq && instruction.OpCount == 2;
+        var isImmediateInsertq = isInsertq && instruction.OpCount == 4;
+        if (!isImmediateExtrq && !isRegisterExtrq && !isImmediateInsertq)
+        {
+            return false;
+        }
+
+        if (instruction.GetOpKind(0) != OpKind.Register ||
+            !TryGetXmmOffset(instruction.GetOpRegister(0), out var destOffset))
+        {
+            return false;
+        }
+
+        var destLow = ReadCtxU64(contextRecord, destOffset);
+        if (isExtrq)
+        {
+            int length;
+            int index;
+            if (isRegisterExtrq)
+            {
+                if (instruction.GetOpKind(1) != OpKind.Register ||
+                    !TryGetXmmOffset(instruction.GetOpRegister(1), out var controlOffset))
+                {
+                    return false;
+                }
+
+                // AMD defines the register form's field length in xmm2[5:0] and its start
+                // index in xmm2[13:8]. Other control bits do not affect the instruction.
+                var control = ReadCtxU64(contextRecord, controlOffset);
+                length = (int)(control & 0x3F);
+                index = (int)((control >> 8) & 0x3F);
+            }
+            else
+            {
+                length = (int)instruction.GetImmediate(1);
+                index = (int)instruction.GetImmediate(2);
+            }
+
+            WriteCtxU64(contextRecord, destOffset, Sse4aBitFieldEmulator.ExtractBitField(destLow, length, index));
+            WriteCtxU64(contextRecord, destOffset + 8, 0);
+        }
+        else
+        {
+            if (instruction.GetOpKind(1) != OpKind.Register ||
+                !TryGetXmmOffset(instruction.GetOpRegister(1), out var srcOffset))
+            {
+                return false;
+            }
+
+            var length = (int)instruction.GetImmediate(2);
+            var index = (int)instruction.GetImmediate(3);
+            WriteCtxU64(contextRecord, destOffset, Sse4aBitFieldEmulator.InsertBitField(
+                destLow, ReadCtxU64(contextRecord, srcOffset), length, index));
+            WriteCtxU64(contextRecord, destOffset + 8, 0);
+        }
+
+        WriteCtxU64(contextRecord, CTX_RIP, rip + (ulong)instruction.Length);
+
+        Interlocked.Increment(ref _sse4aInstructionsEmulated);
+        if (Interlocked.Exchange(ref _sse4aSoftwareFallbackAnnounced, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][INFO] Host lacks SSE4a EXTRQ/INSERTQ used by the guest; " +
+                "emulating those instructions in software.");
+        }
+
+        return true;
+    }
+
+    // Maps an Iced XMM register to its byte offset in the Win64 CONTEXT record. Written as an
+    // explicit switch (rather than arithmetic on the Register enum) to match the style already
+    // used by TryGetGprSlot/TryGetGpr64Offset in DirectExecutionBackend.IllegalInstruction.cs.
+    private static bool TryGetXmmOffset(Register register, out int offset)
+    {
+        switch (register)
+        {
+            case Register.XMM0: offset = Win64ContextXmm0Offset + 16 * 0; return true;
+            case Register.XMM1: offset = Win64ContextXmm0Offset + 16 * 1; return true;
+            case Register.XMM2: offset = Win64ContextXmm0Offset + 16 * 2; return true;
+            case Register.XMM3: offset = Win64ContextXmm0Offset + 16 * 3; return true;
+            case Register.XMM4: offset = Win64ContextXmm0Offset + 16 * 4; return true;
+            case Register.XMM5: offset = Win64ContextXmm0Offset + 16 * 5; return true;
+            case Register.XMM6: offset = Win64ContextXmm0Offset + 16 * 6; return true;
+            case Register.XMM7: offset = Win64ContextXmm0Offset + 16 * 7; return true;
+            case Register.XMM8: offset = Win64ContextXmm0Offset + 16 * 8; return true;
+            case Register.XMM9: offset = Win64ContextXmm0Offset + 16 * 9; return true;
+            case Register.XMM10: offset = Win64ContextXmm0Offset + 16 * 10; return true;
+            case Register.XMM11: offset = Win64ContextXmm0Offset + 16 * 11; return true;
+            case Register.XMM12: offset = Win64ContextXmm0Offset + 16 * 12; return true;
+            case Register.XMM13: offset = Win64ContextXmm0Offset + 16 * 13; return true;
+            case Register.XMM14: offset = Win64ContextXmm0Offset + 16 * 14; return true;
+            case Register.XMM15: offset = Win64ContextXmm0Offset + 16 * 15; return true;
+            default:
+                offset = 0;
+                return false;
+        }
+    }
+}

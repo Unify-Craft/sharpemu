@@ -1,0 +1,6292 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.ShaderCompiler;
+
+namespace SharpEmu.ShaderCompiler.Vulkan;
+
+public static partial class Gen5SpirvTranslator
+{
+    private sealed partial class CompilationContext
+    {
+        private uint _integerReciprocalFunction;
+
+        private void DeclareIntegerReciprocalFunction()
+        {
+            if (!_request.Program.Instructions.Any(instruction => instruction.Opcode == "VRcpIflagF32"))
+            {
+                return;
+            }
+
+            // Keep integer reciprocal lowering outside the caller's optimization region.
+            const uint dontInline = 2;
+            var functionType = _module.TypeFunction(_floatType, _floatType);
+            _integerReciprocalFunction = _module.BeginFunction(_floatType, functionType, dontInline);
+            var source = _module.AddFunctionParameter(_floatType);
+            _module.AddLabel();
+            var reciprocal = _module.AddInstruction(SpirvOp.FDiv, _floatType, Float(1), source);
+            _module.AddStatement(SpirvOp.ReturnValue, reciprocal);
+            _module.EndFunction();
+        }
+
+        private bool TryEmitVectorAlu(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Opcode == "VNop")
+            {
+                return true;
+            }
+
+            if (instruction.Control is Gen5SdwaControl sdwa &&
+                (sdwa.Source0Select == 7 ||
+                 sdwa.Source1Select == 7 ||
+                 sdwa.DestinationSelect == 7 ||
+                 sdwa.DestinationUnused == 3))
+            {
+                error = $"reserved SDWA selector/modifier in {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Control is Gen5DppControl dppControl &&
+                !IsSupportedDppControl(dppControl.Control))
+            {
+                error = $"unsupported DPP16 control 0x{dppControl.Control:X3}";
+                return false;
+            }
+
+            if (instruction.Opcode.StartsWith("VCmp", StringComparison.Ordinal))
+            {
+                return TryEmitVectorCompare(instruction, out error);
+            }
+
+            if (instruction.Opcode == "VReadfirstlaneB32")
+            {
+                if (instruction.Destinations.Count == 0 ||
+                    instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister ||
+                    instruction.Sources.Count == 0)
+                {
+                    error = "invalid read-first-lane operands";
+                    return false;
+                }
+
+                var value = _pairedLanes
+                    ? PairedReadFirstLane(instruction)
+                    : BroadcastFirstWaveActive(GetRawSource(instruction, 0));
+
+                StoreS(instruction.Destinations[0].Value, value);
+                return true;
+            }
+
+            if (instruction.Opcode == "VReadlaneB32")
+            {
+                return TryEmitReadlane(instruction, out error);
+            }
+
+            if (!TryGetVectorDestination(instruction, out var destination))
+            {
+                error = "missing vector destination";
+                return false;
+            }
+
+            if (instruction.Opcode is "VMovrelsB32" or "VMovreldB32" or
+                "VMovrelsdB32" or "VMovrelsd2B32")
+            {
+                return TryEmitMoveRelative(instruction, destination, out error);
+            }
+
+            uint result;
+            switch (instruction.Opcode)
+            {
+                case "VMovB32":
+                    result = GetRawSource(instruction, 0);
+                    break;
+                case "VWritelaneB32":
+                {
+                    var oldValue = LoadV(destination);
+                    var sourceValue = GetRawSource(instruction, 0);
+                    var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(LaneSelectMask));
+                    if (TryGetConstantLane(instruction, out var constantLane))
+                    {
+                        if (_laneSpillSlots.TryGetValue((destination, constantLane), out var slot))
+                        {
+                            Store(slot, sourceValue);
+                        }
+                    }
+                    else if (_laneSpillSlots.Count != 0)
+                    {
+                        foreach (var ((slotRegister, slotLane), variable) in _laneSpillSlots)
+                        {
+                            if (slotRegister != destination)
+                            {
+                                continue;
+                            }
+
+                            var isSlotLane = _module.AddInstruction(SpirvOp.IEqual, _boolType, selectedLane, UInt(slotLane));
+                            Store(variable, _module.AddInstruction(
+                                SpirvOp.Select, _uintType, isSlotLane, sourceValue, Load(_uintType, variable)));
+                        }
+                    }
+
+                    var isTargetLane = _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        GuestWaveLane(),
+                        selectedLane);
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        isTargetLane,
+                        sourceValue,
+                        oldValue);
+                    // Writelane writes to a specific lane regardless of exec mask.
+                    StoreV(destination, result, guardWithExec: false, preserveSavedLanes: true);
+                    if (_stage == Gen5SpirvStage.Compute && !_pairedLanes && !_hasIndirectControlFlow &&
+                        TryGetFixedLane(instruction.Sources[1], out var savedLane) &&
+                        instruction.Sources[0] is { Kind: Gen5OperandKind.ScalarRegister, Value: < 102 })
+                    {
+                        if (!_savedLaneValues.TryGetValue(destination, out var savedValues))
+                        {
+                            savedValues = new Dictionary<uint, uint>();
+                            _savedLaneValues.Add(destination, savedValues);
+                        }
+                        savedValues[savedLane] = sourceValue;
+                    }
+                    else
+                    {
+                        _savedLaneValues.Remove(destination);
+                    }
+                    return true;
+                }
+                case "VCndmaskB32":
+                {
+                    var condition = instruction.Sources.Count > 2
+                        ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                        : Load(_boolType, _vcc);
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        condition,
+                        GetSignModifiedSource(instruction, 1),
+                        GetSignModifiedSource(instruction, 0));
+                    break;
+                }
+                case "VCvtU32F32":
+                    result = ConvertFloatToUnsignedSaturated(GetFloatSource(instruction, 0));
+                    break;
+                case "VCvtU16F16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var sourceIsNan = _module.AddInstruction(
+                        SpirvOp.IsNan,
+                        _boolType,
+                        source);
+                    source = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        sourceIsNan,
+                        Float(0),
+                        source);
+                    var bounded = Ext(43, _floatType, source, Float(0), Float(65535));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(
+                            _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded),
+                            UInt(0xFFFF)));
+                    break;
+                }
+                case "VCvtF16U16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            GetInt16Source(instruction, 0, signed: false)));
+                    break;
+                case "VCvtF16I16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertSToF,
+                            _floatType,
+                            Bitcast(_intType, GetInt16Source(instruction, 0, signed: true))));
+                    break;
+                case "VCvtI16F16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var sourceIsNan = _module.AddInstruction(
+                        SpirvOp.IsNan,
+                        _boolType,
+                        source);
+                    source = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        sourceIsNan,
+                        Float(0),
+                        source);
+                    var bounded = Ext(43, _floatType, source, Float(-32768), Float(32767));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(
+                            Bitcast(
+                                _uintType,
+                                _module.AddInstruction(SpirvOp.ConvertFToS, _intType, bounded)),
+                            UInt(0xFFFF)));
+                    break;
+                }
+                case "VCvtI32F32":
+                case "VCvtRpiI32F32":
+                case "VCvtFlrI32F32":
+                {
+                    var source = GetFloatSource(instruction, 0);
+                    if (instruction.Opcode == "VCvtRpiI32F32")
+                    {
+                        source = Ext(8, _floatType, _module.AddInstruction(SpirvOp.FAdd, _floatType, source, Float(0.5f)));
+                    }
+                    else if (instruction.Opcode == "VCvtFlrI32F32")
+                    {
+                        source = Ext(8, _floatType, source);
+                    }
+
+                    result = ConvertFloatToSignedSaturated(source);
+                    break;
+                }
+                case "VCvtF32I32":
+                {
+                    var signed = Bitcast(_intType, GetRawSource(instruction, 0));
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(SpirvOp.ConvertSToF, _floatType, signed));
+                    break;
+                }
+                case "VCvtF32U32":
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            GetRawSource(instruction, 0)));
+                    break;
+                case "VCvtF32Ubyte0":
+                case "VCvtF32Ubyte1":
+                case "VCvtF32Ubyte2":
+                case "VCvtF32Ubyte3":
+                {
+                    var shift = (uint)(instruction.Opcode[^1] - '0') * 8;
+                    var raw = ShiftRightLogical(GetRawSource(instruction, 0), UInt(shift));
+                    raw = BitwiseAnd(raw, UInt(0xFF));
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, raw));
+                    break;
+                }
+                case "VCvtF16F32":
+                {
+                    var vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        ApplyOutputModifiers(instruction, GetFloatSource(instruction, 0)),
+                        Float(0));
+                    result = EmitHalfResult(
+                        instruction,
+                        destination,
+                        BitwiseAnd(Ext(58, _uintType, vector), UInt(0xFFFF)));
+                    break;
+                }
+                case "VCvtF32F16":
+                {
+                    var unpacked = Ext(62, _vec2Type, GetRawSource(instruction, 0));
+                    var value = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        unpacked,
+                        0);
+                    result = EmitFloatResult(instruction, value);
+                    break;
+                }
+                case "VCvtOffF32I4":
+                    result = EmitCvtOffF32I4(instruction);
+                    break;
+                case "VCvtF64I32":
+                case "VCvtF64U32":
+                {
+                    var source = GetRawSource(instruction, 0);
+                    var converted = _module.AddInstruction(
+                        instruction.Opcode == "VCvtF64I32"
+                            ? SpirvOp.ConvertSToF
+                            : SpirvOp.ConvertUToF,
+                        DoubleType(),
+                        instruction.Opcode == "VCvtF64I32"
+                            ? Bitcast(_intType, source)
+                            : source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            converted,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtF64F32":
+                {
+                    var converted = _module.AddInstruction(
+                        SpirvOp.FConvert,
+                        DoubleType(),
+                        GetFloatSource(instruction, 0));
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            converted,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtI32F64":
+                case "VCvtU32F64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    result = ConvertDoubleToIntegerSaturated(source, instruction.Opcode == "VCvtI32F64");
+                    break;
+                }
+                case "VTruncF64":
+                case "VCeilF64":
+                case "VRndneF64":
+                case "VFloorF64":
+                case "VFractF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var rounded = Ext(instruction.Opcode switch
+                    {
+                        "VTruncF64" => 3u,
+                        "VCeilF64" => 9u,
+                        "VRndneF64" => 2u,
+                        "VFloorF64" => 8u,
+                        _ => 10u,
+                    }, DoubleType(), source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            rounded,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VAddF64":
+                case "VMinF64":
+                case "VMaxF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var left, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var right, out error))
+                    {
+                        return false;
+                    }
+
+                    var combined = instruction.Opcode switch
+                    {
+                        "VAddF64" => _module.AddInstruction(SpirvOp.FAdd, DoubleType(), left, right),
+                        "VMinF64" => Ext(79, DoubleType(), left, right),
+                        _ => Ext(80, DoubleType(), left, right),
+                    };
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            combined,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VLdexpF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var mantissa, out error))
+                    {
+                        return false;
+                    }
+
+                    var scaled = Ext(53, DoubleType(), mantissa, Bitcast(_intType, GetRawSource(instruction, 1)));
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            scaled,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtF32F64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.FConvert, _floatType, source));
+                    break;
+                }
+                case "VRcpF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var reciprocal = _module.AddInstruction(
+                        SpirvOp.FDiv,
+                        DoubleType(),
+                        Double(1.0),
+                        source);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            reciprocal,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VRsqF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    var root = Ext(31, DoubleType(), source);
+                    var reciprocal = _module.AddInstruction(
+                        SpirvOp.FDiv,
+                        DoubleType(),
+                        Double(1.0),
+                        root);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            reciprocal,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VSqrtF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var source, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            Ext(31, DoubleType(), source),
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VMulF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var left, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var right, out error))
+                    {
+                        return false;
+                    }
+
+                    var product = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        DoubleType(),
+                        left,
+                        right);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            product,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VFmaF64":
+                {
+                    if (!TryGetDoubleSource(instruction, 0, out var first, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 1, out var second, out error))
+                    {
+                        return false;
+                    }
+
+                    if (!TryGetDoubleSource(instruction, 2, out var third, out error))
+                    {
+                        return false;
+                    }
+
+                    var fused = Ext(50, DoubleType(), first, second, third);
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            fused,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+                case "VCvtPkU8F32":
+                {
+                    var converted = _module.AddInstruction(
+                        SpirvOp.ConvertFToU,
+                        _uintType,
+                        Ext(81, _floatType, GetFloatSource(instruction, 0), Float(0), Float(255)));
+                    var offset = ShiftLeftLogical(
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(3)),
+                        UInt(3));
+                    result = _module.AddInstruction(
+                        SpirvOp.BitFieldInsert,
+                        _uintType,
+                        GetRawSource(instruction, 2),
+                        converted,
+                        offset,
+                        UInt(8));
+                    break;
+                }
+                case "VRcpF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.FDiv,
+                            _floatType,
+                            Float(1),
+                            EmitFlushF32DenormToSignedZero(
+                                GetFloatSource(instruction, 0))));
+                    break;
+                case "VRcpIflagF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.FunctionCall,
+                            _floatType,
+                            _integerReciprocalFunction,
+                            GetFloatSource(instruction, 0)));
+                    break;
+                case "VLogF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            30,
+                            _floatType,
+                            EmitFlushF32DenormToSignedZero(
+                                GetFloatSource(instruction, 0))));
+                    break;
+                case "VLdexpF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            53,
+                            _floatType,
+                            GetFloatSource(instruction, 0),
+                            Bitcast(_intType, GetRawSource(instruction, 1))));
+                    break;
+                case "VExpF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            29,
+                            _floatType,
+                            EmitFlushF32DenormToSignedZero(
+                                GetFloatSource(instruction, 0))));
+                    break;
+                case "VRsqF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            32,
+                            _floatType,
+                            EmitFlushF32DenormToSignedZero(
+                                GetFloatSource(instruction, 0))));
+                    break;
+                case "VSqrtF16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var positive = _module.AddInstruction(SpirvOp.FOrdGreaterThan, _boolType, source, Float(0));
+                    var zero = _module.AddInstruction(SpirvOp.FOrdEqual, _boolType, source, Float(0));
+                    var infinite = _module.AddInstruction(SpirvOp.FOrdEqual, _boolType, source, Float(float.PositiveInfinity));
+                    var argument = _module.AddInstruction(SpirvOp.Select, _floatType, positive, source, Float(1));
+                    var root = Ext(31, _floatType, argument);
+                    root = _module.AddInstruction(SpirvOp.Select, _floatType, infinite, source, root);
+                    root = _module.AddInstruction(SpirvOp.Select, _floatType, positive, root,
+                        Bitcast(_floatType, UInt(0xFFC00000)));
+                    root = _module.AddInstruction(SpirvOp.Select, _floatType, zero, source, root);
+                    result = EmitFloat16Result(instruction, destination, root);
+                    break;
+                }
+                case "VRcpF16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var bits = Bitcast(_uintType, source);
+                    var sign = BitwiseAnd(bits, UInt(0x80000000));
+                    var magnitude = BitwiseAnd(bits, UInt(0x7FFFFFFF));
+                    var zero = _module.AddInstruction(SpirvOp.IEqual, _boolType, magnitude, UInt(0));
+                    var infinite = _module.AddInstruction(SpirvOp.IEqual, _boolType, magnitude, UInt(0x7F800000));
+                    var denominator = _module.AddInstruction(SpirvOp.Select, _floatType, zero, Float(1), source);
+                    var reciprocal = _module.AddInstruction(SpirvOp.FDiv, _floatType, Float(1), denominator);
+                    reciprocal = _module.AddInstruction(SpirvOp.Select, _floatType, zero,
+                        Bitcast(_floatType, BitwiseOr(sign, UInt(0x7F800000))), reciprocal);
+                    reciprocal = _module.AddInstruction(SpirvOp.Select, _floatType, infinite,
+                        Bitcast(_floatType, sign), reciprocal);
+                    result = EmitFloat16Result(instruction, destination, reciprocal);
+                    break;
+                }
+                case "VExpF16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var overflow = _module.AddInstruction(SpirvOp.FOrdGreaterThanEqual, _boolType, source, Float(128));
+                    var underflow = _module.AddInstruction(SpirvOp.FOrdLessThan, _boolType, source, Float(-126));
+                    var nan = _module.AddInstruction(SpirvOp.IsNan, _boolType, source);
+                    var exponential = Ext(29, _floatType, Ext(43, _floatType, source, Float(-126), Float(127)));
+                    exponential = _module.AddInstruction(SpirvOp.Select, _floatType, overflow, Float(float.PositiveInfinity), exponential);
+                    exponential = _module.AddInstruction(SpirvOp.Select, _floatType, underflow, Float(0), exponential);
+                    exponential = _module.AddInstruction(SpirvOp.Select, _floatType, nan, Bitcast(_floatType, UInt(0x7FC00000)), exponential);
+                    result = EmitFloat16Result(instruction, destination, exponential);
+                    break;
+                }
+                case "VLogF16":
+                {
+                    var source = GetFloat16Source(instruction, 0);
+                    var positive = _module.AddInstruction(SpirvOp.FOrdGreaterThan, _boolType, source, Float(0));
+                    var zero = _module.AddInstruction(SpirvOp.FOrdEqual, _boolType, source, Float(0));
+                    var infinite = _module.AddInstruction(SpirvOp.FOrdEqual, _boolType, source, Float(float.PositiveInfinity));
+                    var argument = _module.AddInstruction(SpirvOp.Select, _floatType, positive, source, Float(1));
+                    var logarithm = Ext(30, _floatType, argument);
+                    logarithm = _module.AddInstruction(SpirvOp.Select, _floatType, infinite, source, logarithm);
+                    var invalid = _module.AddInstruction(SpirvOp.Select, _floatType, zero,
+                        Float(float.NegativeInfinity), Bitcast(_floatType, UInt(0xFFC00000)));
+                    result = EmitFloat16Result(instruction, destination,
+                        _module.AddInstruction(SpirvOp.Select, _floatType, positive, logarithm, invalid));
+                    break;
+                }
+                case "VFloorF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(8, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VCeilF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(9, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VTruncF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(3, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VRndneF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(2, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VFractF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(10, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSinF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(13, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
+                    break;
+                case "VCosF16":
+                    result = EmitFloat16Result(instruction, destination, Ext(14, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
+                    break;
+                case "VRsqF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(32, _floatType, GetFloat16Source(instruction, 0)));
+                    break;
+                case "VFractF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(10, _floatType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VTruncF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(3, _floatType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VCeilF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(9, _floatType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VRndneF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(2, _floatType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VFloorF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(8, _floatType, GetFloatSource(instruction, 0)));
+                    break;
+                case "VSqrtF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            31,
+                            _floatType,
+                            EmitFlushF32DenormToSignedZero(
+                                GetFloatSource(instruction, 0))));
+                    break;
+                case "VSinF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            13,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                EmitTrigCycleF32(
+                                    GetFloatSource(instruction, 0),
+                                    preserveSignedZero: true),
+                                Float(MathF.Tau))));
+                    break;
+                case "VCosF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            14,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                EmitTrigCycleF32(
+                                    GetFloatSource(instruction, 0),
+                                    preserveSignedZero: false),
+                                Float(MathF.Tau))));
+                    break;
+                case "VAddF32":
+                    result = EmitFloatBinary(instruction, SpirvOp.FAdd);
+                    break;
+                case "VAddF16":
+                    result = EmitFloat16Binary(instruction, destination, SpirvOp.FAdd);
+                    break;
+                case "VSubF32":
+                    result = EmitFloatBinary(instruction, SpirvOp.FSub);
+                    break;
+                case "VSubrevF32":
+                    result = EmitFloatBinary(instruction, SpirvOp.FSub, reverse: true);
+                    break;
+                case "VSubF16":
+                    result = EmitFloat16Binary(instruction, destination, SpirvOp.FSub);
+                    break;
+                case "VSubrevF16":
+                    result = EmitFloat16Binary(
+                        instruction,
+                        destination,
+                        SpirvOp.FSub,
+                        reverse: true);
+                    break;
+                case "VMulF32":
+                    result = EmitFloatBinary(instruction, SpirvOp.FMul);
+                    break;
+                case "VMulF16":
+                    result = EmitFloat16Binary(instruction, destination, SpirvOp.FMul);
+                    break;
+                case "VMinF32":
+                    result = EmitFloatExtBinary(instruction, 37);
+                    break;
+                case "VMaxF32":
+                    result = EmitFloatExtBinary(instruction, 40);
+                    break;
+                case "VMinF16":
+                    result = EmitMinimumHalfResult(instruction, destination, false);
+                    break;
+                case "VMaxF16":
+                    result = EmitFloat16ExtBinary(instruction, destination, 40);
+                    break;
+                case "VFmaF16":
+                case "VFmaMkF16":
+                case "VFmaAkF16":
+                {
+                    var fusedBits = EmitPackedF16FusedMultiplyAdd(
+                        GetFloat16Source(instruction, 0),
+                        GetFloat16Source(instruction, 1),
+                        GetFloat16Source(instruction, 2));
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Bitcast(_floatType, fusedBits));
+                    break;
+                }
+                case "VMadF32":
+                case "VFmaF32":
+                case "VMadMkF32":
+                case "VMadAkF32":
+                case "VFmaMkF32":
+                case "VFmaAkF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            50,
+                            _floatType,
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            GetFloatSource(instruction, 2)));
+                    break;
+                case "VMacF32":
+                case "VFmacF32":
+                {
+                    var addend = Bitcast(_floatType, LoadV(destination));
+                    result = EmitFloatResult(
+                        instruction,
+                        Ext(
+                            50,
+                            _floatType,
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            addend));
+                    break;
+                }
+                case "VDot2cF32F16":
+                {
+                    // The two packed half pairs are widened before the
+                    // products are accumulated in f32 on top of the previous
+                    // value of the destination.  Only the clamp of the
+                    // encoding limits the result.
+                    var left = GetPackedF16Source(instruction, 0);
+                    var right = GetPackedF16Source(instruction, 1);
+                    var lowProduct = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        EmitPackedF16Half(left, highLane: false),
+                        EmitPackedF16Half(right, highLane: false));
+                    var highProduct = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        EmitPackedF16Half(left, highLane: true),
+                        EmitPackedF16Half(right, highLane: true));
+                    var dot = _module.AddInstruction(SpirvOp.FAdd, _floatType, lowProduct, highProduct);
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.FAdd,
+                            _floatType,
+                            dot,
+                            Bitcast(_floatType, LoadV(destination))));
+                    break;
+                }
+                case "VMax3F16":
+                case "VMed3F16":
+                {
+                    // Every f16 value widens to f32 exactly, and min/max pick one
+                    // input, so the f32 result narrows back without rounding.
+                    if (TryGetNativeHalfSources(instruction, 3, selects: true, out var halves))
+                    {
+                        result = EmitNativeHalfResult(instruction, destination, instruction.Opcode == "VMax3F16"
+                            ? NanIgnoringMinMax(40, NanIgnoringMinMax(40, halves[0], halves[1], _halfType), halves[2], _halfType)
+                            : EmitFloatMedian(halves[0], halves[1], halves[2], _halfType));
+                        break;
+                    }
+
+                    var a = GetFloat16Source(instruction, 0);
+                    var b = GetFloat16Source(instruction, 1);
+                    var c = GetFloat16Source(instruction, 2);
+                    var value = instruction.Opcode switch
+                    {
+                        "VMax3F16" => NanIgnoringMinMax(40, NanIgnoringMinMax(40, a, b), c),
+                        _ => EmitFloatMedian(a, b, c),
+                    };
+                    result = EmitFloat16Result(instruction, destination, value);
+                    break;
+                }
+                case "VMin3I16":
+                case "VMin3U16":
+                case "VMax3I16":
+                case "VMax3U16":
+                case "VMed3I16":
+                case "VMed3U16":
+                {
+                    if (instruction.Control is Gen5Vop3Control { Clamp: true })
+                    {
+                        error = $"{instruction.Opcode}: clamped 16-bit integer results are not supported";
+                        return false;
+                    }
+
+                    // The halves are sign- or zero-extended to 32 bits, so the 32-bit min and max
+                    // of the extended values are the 16-bit ones.
+                    var signed = instruction.Opcode.EndsWith("I16", StringComparison.Ordinal);
+                    uint Minimum(uint a, uint b) => signed
+                        ? Bitcast(_uintType, Ext(39, _intType, Bitcast(_intType, a), Bitcast(_intType, b)))
+                        : Ext(38, _uintType, a, b);
+                    uint Maximum(uint a, uint b) => signed
+                        ? Bitcast(_uintType, Ext(42, _intType, Bitcast(_intType, a), Bitcast(_intType, b)))
+                        : Ext(41, _uintType, a, b);
+                    var a = GetInt16Source(instruction, 0, signed);
+                    var b = GetInt16Source(instruction, 1, signed);
+                    var c = GetInt16Source(instruction, 2, signed);
+                    var value = instruction.Opcode switch
+                    {
+                        "VMin3I16" or "VMin3U16" => Minimum(Minimum(a, b), c),
+                        "VMax3I16" or "VMax3U16" => Maximum(Maximum(a, b), c),
+                        _ => Maximum(Minimum(a, b), Minimum(Maximum(a, b), c)),
+                    };
+                    result = EmitInt16Result(instruction, destination, value);
+                    break;
+                }
+                case "VMin3F32":
+                    result = EmitFloatTernaryExt(instruction, 37);
+                    break;
+                case "VMin3F16":
+                    result = EmitMinimumHalfResult(instruction, destination, true);
+                    break;
+                case "VMax3F32":
+                    result = EmitFloatTernaryExt(instruction, 40);
+                    break;
+                case "VAndB32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.BitwiseAnd);
+                    break;
+                case "VOrB32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.BitwiseOr);
+                    break;
+                case "VXorB32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.BitwiseXor);
+                    break;
+                case "VXor3B32":
+                    result = _module.AddInstruction(SpirvOp.BitwiseXor, _uintType,
+                        EmitIntegerBinary(instruction, SpirvOp.BitwiseXor), GetRawSource(instruction, 2));
+                    break;
+                case "VXnorB32":
+                {
+                    var xor = EmitIntegerBinary(instruction, SpirvOp.BitwiseXor);
+                    result = _module.AddInstruction(SpirvOp.Not, _uintType, xor);
+                    break;
+                }
+                case "VNotB32":
+                    result = _module.AddInstruction(
+                        SpirvOp.Not,
+                        _uintType,
+                        GetRawSource(instruction, 0));
+                    break;
+                case "VBfrevB32":
+                    result = _module.AddInstruction(
+                        SpirvOp.BitReverse,
+                        _uintType,
+                        GetRawSource(instruction, 0));
+                    break;
+                case "VFfbhU32":
+                {
+                    var source = GetRawSource(instruction, 0);
+                    var msb = Bitcast(
+                        _uintType,
+                        Ext(75, _intType, source));
+                    var position = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(31),
+                        msb);
+                    var nonzero = _module.AddInstruction(
+                        SpirvOp.INotEqual,
+                        _boolType,
+                        source,
+                        UInt(0));
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        nonzero,
+                        position,
+                        UInt(uint.MaxValue));
+                    break;
+                }
+                case "VFfbhI32":
+                {
+                    // First bit that differs from the sign bit, counted from bit 31; ~0 for 0 and -1.
+                    var source = GetRawSource(instruction, 0);
+                    var msb = Bitcast(
+                        _uintType,
+                        Ext(74, _intType, Bitcast(_intType, source)));
+                    var position = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(31),
+                        msb);
+                    var found = _module.AddInstruction(
+                        SpirvOp.INotEqual,
+                        _boolType,
+                        msb,
+                        UInt(uint.MaxValue));
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        found,
+                        position,
+                        UInt(uint.MaxValue));
+                    break;
+                }
+                case "VFfblB32":
+                    result = Bitcast(
+                        _uintType,
+                        Ext(
+                            73,
+                            _intType,
+                            Bitcast(_intType, GetRawSource(instruction, 0))));
+                    break;
+                case "VAddI32":
+                case "VAddU32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.IAdd);
+                    break;
+                case "VAddNcU16":
+                    result = EmitInteger16Binary(
+                        instruction,
+                        destination,
+                        SpirvOp.IAdd);
+                    break;
+                case "VAddcU32":
+                case "VAddCoCiU32":
+                    result = EmitAddWithCarry(instruction);
+                    break;
+                case "VSubI32":
+                case "VSubU32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.ISub);
+                    break;
+                case "VSubrevI32":
+                case "VSubrevU32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.ISub, reverse: true);
+                    break;
+                case "VSubbU32":
+                case "VSubCoCiU32":
+                    result = EmitSubtractWithBorrow(instruction, reverse: false);
+                    break;
+                case "VSubbrevU32":
+                case "VSubrevCoCiU32":
+                    result = EmitSubtractWithBorrow(instruction, reverse: true);
+                    break;
+                case "VMulI32I24":
+                {
+                    var signedLeft = _module.AddInstruction(SpirvOp.BitFieldSExtract, _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)), UInt(0), UInt(24));
+                    var signedRight = _module.AddInstruction(SpirvOp.BitFieldSExtract, _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)), UInt(0), UInt(24));
+                    result = _module.AddInstruction(SpirvOp.IMul, _uintType,
+                        Bitcast(_uintType, signedLeft), Bitcast(_uintType, signedRight));
+                    break;
+                }
+                case "VMulLoU32":
+                case "VMulLoI32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.IMul);
+                    break;
+                case "VMulU32U24":
+                    result = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0x00FF_FFFF)),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(0x00FF_FFFF)));
+                    break;
+                case "VMulHiU32":
+                case "VMulHiU32U24":
+                {
+                    var left = GetRawSource(instruction, 0);
+                    var right = GetRawSource(instruction, 1);
+                    if (instruction.Opcode == "VMulHiU32U24")
+                    {
+                        left = BitwiseAnd(left, UInt(0x00FF_FFFF));
+                        right = BitwiseAnd(right, UInt(0x00FF_FFFF));
+                    }
+
+                    result = MultiplyExtended(left, right, signed: false).High;
+                    break;
+                }
+                case "VMulHiI32":
+                {
+                    result = Bitcast(
+                        _uintType,
+                        MultiplyExtended(
+                            Bitcast(_intType, GetRawSource(instruction, 0)),
+                            Bitcast(_intType, GetRawSource(instruction, 1)),
+                            signed: true).High);
+                    break;
+                }
+                case "VBcntU32B32":
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.BitCount,
+                            _uintType,
+                            GetRawSource(instruction, 0)),
+                        GetRawSource(instruction, 1));
+                    break;
+                case "VMbcntHiU32B32":
+                {
+                    var guestLane = GuestWaveLane();
+                    var lane = BitwiseAnd(guestLane, UInt(31));
+                    var partialMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), lane),
+                        UInt(1));
+                    var countedBits = _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        BitwiseAnd(GetRawSource(instruction, 0), partialMask));
+                    var isUpperHalf = _module.AddInstruction(
+                        SpirvOp.UGreaterThanEqual,
+                        _boolType,
+                        guestLane,
+                        UInt(32));
+                    result = IAdd(
+                        GetRawSource(instruction, 1),
+                        _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            isUpperHalf,
+                            countedBits,
+                            UInt(0)));
+                    break;
+                }
+                case "VMbcntLoU32B32":
+                {
+                    var guestLane = GuestWaveLane();
+                    var lane = BitwiseAnd(guestLane, UInt(31));
+                    var partialMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), lane),
+                        UInt(1));
+                    var lowBitsMask = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.UGreaterThanEqual,
+                            _boolType,
+                            guestLane,
+                            UInt(32)),
+                        UInt(uint.MaxValue),
+                        partialMask);
+                    result = IAdd(
+                        GetRawSource(instruction, 1),
+                        _module.AddInstruction(
+                            SpirvOp.BitCount,
+                            _uintType,
+                            BitwiseAnd(GetRawSource(instruction, 0), lowBitsMask)));
+                    break;
+                }
+                case "VBfmB32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 0), UInt(31));
+                    var lowMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), width),
+                        UInt(1));
+                    result = ShiftLeftLogical(lowMask, GetRawSource(instruction, 1));
+                    break;
+                }
+                case "VMadI32I24":
+                {
+                    // D = S0 * S1 + S2 with S0 and S1 taken as signed 24-bit
+                    // values; the product wraps in 32 bits before the add.
+                    var signedLeft = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        UInt(0),
+                        UInt(24));
+                    var signedRight = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)),
+                        UInt(0),
+                        UInt(24));
+                    var product = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        Bitcast(_uintType, signedLeft),
+                        Bitcast(_uintType, signedRight));
+                    result = IAdd(product, GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VMadU32U24":
+                {
+                    var left = BitwiseAnd(
+                        GetRawSource(instruction, 0),
+                        UInt(0x00FF_FFFF));
+                    var right = BitwiseAnd(
+                        GetRawSource(instruction, 1),
+                        UInt(0x00FF_FFFF));
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            left,
+                            right),
+                        GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VMadU32U16":
+                {
+                    // op_sel picks the half of each 16-bit source.
+                    var left = GetInt16Source(instruction, 0, signed: false);
+                    var right = GetInt16Source(instruction, 1, signed: false);
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            left,
+                            right),
+                        GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VLshrB32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.ShiftRightLogical);
+                    break;
+                case "VLshrrevB32":
+                    result = EmitIntegerBinary(
+                        instruction,
+                        SpirvOp.ShiftRightLogical,
+                        reverse: true);
+                    break;
+                case "VLshlrevB64":
+                case "VLshrrevB64":
+                {
+                    var shift = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                    var value = GetRawSource64(instruction, 1);
+                    var shifted = instruction.Opcode == "VLshlrevB64"
+                        ? ShiftLeftLogical64(value, shift)
+                        : ShiftRightLogical64(value, shift);
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        shifted);
+                    StoreV(
+                        destination + 1,
+                        _module.AddInstruction(
+                            SpirvOp.UConvert,
+                            _uintType,
+                            ShiftRightLogical64(
+                                shifted,
+                                _module.Constant64(_ulongType, 32))));
+                    break;
+                }
+                case "VLshlB32":
+                    result = EmitIntegerBinary(instruction, SpirvOp.ShiftLeftLogical);
+                    break;
+                case "VLshlrevB32":
+                    result = EmitIntegerBinary(
+                        instruction,
+                        SpirvOp.ShiftLeftLogical,
+                        reverse: true);
+                    break;
+                case "VAshrI32":
+                case "VAshrrevI32":
+                {
+                    var reverse = instruction.Opcode == "VAshrrevI32";
+                    var left = GetRawSource(instruction, reverse ? 1 : 0);
+                    var right = GetRawSource(instruction, reverse ? 0 : 1);
+                    result = ShiftRightArithmetic(left, right);
+                    break;
+                }
+                case "VLshlAddU32":
+                {
+                    var shifted = ShiftLeftLogical(
+                        GetRawSource(instruction, 0),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(31)));
+                    result = IAdd(shifted, GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VXadU32":
+                    result = IAdd(
+                        BitwiseXor(GetRawSource(instruction, 0), GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VLshlOrU32":
+                {
+                    var shifted = ShiftLeftLogical(
+                        GetRawSource(instruction, 0),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(31)));
+                    result = BitwiseOr(
+                        shifted,
+                        GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VAndOrB32":
+                    result = BitwiseOr(
+                        BitwiseAnd(
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VOr3U32":
+                    result = BitwiseOr(
+                        BitwiseOr(
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VPermB32":
+                {
+                    var first = GetRawSource(instruction, 0);
+                    var second = GetRawSource(instruction, 1);
+                    var selectors = GetRawSource(instruction, 2);
+                    result = UInt(0);
+                    for (var shift = 0u; shift < 32; shift += 8)
+                    {
+                        var selector = BitwiseAnd(ShiftRightLogical(selectors, UInt(shift)), UInt(255));
+                        var byteSelection = UCmp(SpirvOp.ULessThan, selector, UInt(8));
+                        var source = SelectU(byteSelection,
+                            SelectU(UCmp(SpirvOp.ULessThan, selector, UInt(4)), second, first),
+                            SelectU(UCmp(SpirvOp.ULessThan, selector, UInt(10)), second, first));
+                        var byteShift = ShiftLeftLogical(BitwiseAnd(selector, UInt(3)), UInt(3));
+                        var selectedByte = BitwiseAnd(ShiftRightLogical(source, byteShift), UInt(255));
+                        var signShift = SelectU(Equal(BitwiseAnd(selector, UInt(1)), 0), UInt(15), UInt(31));
+                        var signByte = BitwiseAnd(ISubU(UInt(0),
+                            BitwiseAnd(ShiftRightLogical(source, signShift), UInt(1))), UInt(255));
+                        var value = SelectU(byteSelection, selectedByte,
+                            SelectU(UCmp(SpirvOp.ULessThan, selector, UInt(12)), signByte,
+                                SelectU(Equal(selector, 12), UInt(0), UInt(255))));
+                        result = BitwiseOr(result, ShiftLeftLogical(value, UInt(shift)));
+                    }
+                    break;
+                }
+                case "VPermlane16B32":
+                    result = EmitPermlane16(instruction, exchangeRows: false);
+                    break;
+                case "VPermlanex16B32":
+                    result = EmitPermlane16(instruction, exchangeRows: true);
+                    break;
+                case "VAddLshlU32":
+                {
+                    var added = IAdd(
+                        GetRawSource(instruction, 0),
+                        GetRawSource(instruction, 1));
+                    result = ShiftLeftLogical(added, GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VAdd3U32":
+                    result = IAdd(
+                        IAdd(
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VSadU32":
+                {
+                    var source0 = GetRawSource(instruction, 0);
+                    var source1 = GetRawSource(instruction, 1);
+                    var minimum = Ext(38, _uintType, source0, source1);
+                    var maximum = Ext(41, _uintType, source0, source1);
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            maximum,
+                            minimum),
+                        GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VMinU32":
+                    result = Ext(
+                        38,
+                        _uintType,
+                        GetRawSource(instruction, 0),
+                        GetRawSource(instruction, 1));
+                    break;
+                case "VMaxU32":
+                    result = Ext(
+                        41,
+                        _uintType,
+                        GetRawSource(instruction, 0),
+                        GetRawSource(instruction, 1));
+                    break;
+                case "VMin3U32":
+                    result = Ext(
+                        38,
+                        _uintType,
+                        Ext(
+                            38,
+                            _uintType,
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VMax3U32":
+                    result = Ext(
+                        41,
+                        _uintType,
+                        Ext(
+                            41,
+                            _uintType,
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
+                case "VMinI32":
+                case "VMaxI32":
+                {
+                    var signedResult = Ext(
+                        instruction.Opcode == "VMinI32" ? 39u : 42u,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        Bitcast(_intType, GetRawSource(instruction, 1)));
+                    result = Bitcast(_uintType, signedResult);
+                    break;
+                }
+                case "VMin3I32":
+                case "VMax3I32":
+                {
+                    var operation = instruction.Opcode == "VMin3I32" ? 39u : 42u;
+                    var left = Bitcast(
+                        _intType,
+                        GetRawSource(instruction, 0));
+                    var middle = Bitcast(
+                        _intType,
+                        GetRawSource(instruction, 1));
+                    var right = Bitcast(
+                        _intType,
+                        GetRawSource(instruction, 2));
+                    result = Bitcast(
+                        _uintType,
+                        Ext(
+                            operation,
+                            _intType,
+                            Ext(operation, _intType, left, middle),
+                            right));
+                    break;
+                }
+                case "VMed3U32":
+                {
+                    var left = GetRawSource(instruction, 0);
+                    var middle = GetRawSource(instruction, 1);
+                    var right = GetRawSource(instruction, 2);
+                    var low = Ext(38, _uintType, left, middle);
+                    var high = Ext(41, _uintType, left, middle);
+                    result = Ext(
+                        41,
+                        _uintType,
+                        low,
+                        Ext(38, _uintType, high, right));
+                    break;
+                }
+                case "VMed3I32":
+                {
+                    var left = Bitcast(_intType, GetRawSource(instruction, 0));
+                    var middle = Bitcast(_intType, GetRawSource(instruction, 1));
+                    var right = Bitcast(_intType, GetRawSource(instruction, 2));
+                    var low = Ext(39, _intType, left, middle);
+                    var high = Ext(42, _intType, left, middle);
+                    result = Bitcast(
+                        _uintType,
+                        Ext(
+                            42,
+                            _intType,
+                            low,
+                            Ext(39, _intType, high, right)));
+                    break;
+                }
+                case "VMed3F32":
+                {
+                    result = EmitFloatResult(
+                        instruction,
+                        EmitFloatMedian(GetFloatSource(instruction, 0), GetFloatSource(instruction, 1), GetFloatSource(instruction, 2)));
+                    break;
+                }
+                case "VCubeidF32":
+                    result = EmitCubeCoordinate(instruction, CubeCoordinate.Id);
+                    break;
+                case "VCubescF32":
+                    result = EmitCubeCoordinate(instruction, CubeCoordinate.Sc);
+                    break;
+                case "VCubetcF32":
+                    result = EmitCubeCoordinate(instruction, CubeCoordinate.Tc);
+                    break;
+                case "VCubemaF32":
+                    result = EmitCubeCoordinate(instruction, CubeCoordinate.Ma);
+                    break;
+                case "VAddCoU32":
+                {
+                    var left = GetRawSource(instruction, 0);
+                    var right = GetRawSource(instruction, 1);
+                    result = IAdd(left, right);
+                    var carry = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        result,
+                        left);
+                    StoreCarryOut(instruction, carry);
+                    break;
+                }
+                case "VSubCoU32":
+                case "VSubrevCoU32":
+                {
+                    var reverse = instruction.Opcode == "VSubrevCoU32";
+                    var left = GetRawSource(instruction, reverse ? 1 : 0);
+                    var right = GetRawSource(instruction, reverse ? 0 : 1);
+                    result = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                    var borrow = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        left,
+                        right);
+                    StoreCarryOut(instruction, borrow);
+                    break;
+                }
+                case "VMadU64U32":
+                {
+                    // V_MAD_U64_U32 writes a 64-bit VGPR pair. The first two
+                    // sources are 32-bit factors; the third is a 64-bit addend
+                    // held in a VGPR or SGPR pair. Its SDST receives the carry
+                    // mask for the unsigned 64-bit addition.
+                    var (productLow, productHigh) = MultiplyExtended(GetRawSource(instruction, 0), GetRawSource(instruction, 1), signed: false);
+                    var product = Pair64(productLow, productHigh);
+                    var addend = GetRawSource64(instruction, 2);
+                    var wideResult = _module.AddInstruction(
+                        SpirvOp.IAdd,
+                        _ulongType,
+                        product,
+                        addend);
+                    var carry = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        wideResult,
+                        addend);
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        wideResult);
+                    var high = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        ShiftRightLogical64(
+                            wideResult,
+                            _module.Constant64(_ulongType, 32)));
+                    StoreV(destination + 1, high);
+                    StoreCarryOut(instruction, carry);
+                    break;
+                }
+                case "VBfeU32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    result = _module.AddInstruction(
+                        SpirvOp.BitFieldUExtract,
+                        _uintType,
+                        GetRawSource(instruction, 0),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
+                        width);
+                    break;
+                }
+                case "VBfeI32":
+                {
+                    // Same extract as VBfeU32 but sign-extended from the top bit
+                    // of the extracted field, so the result type must be signed
+                    // and bitcast back for storage.
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, GetRawSource(instruction, 0)),
+                            BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
+                            width));
+                    break;
+                }
+                case "VBfiB32":
+                {
+                    var mask = GetRawSource(instruction, 0);
+                    var insert = GetRawSource(instruction, 1);
+                    var source = GetRawSource(instruction, 2);
+                    result = _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _uintType,
+                        BitwiseAnd(mask, insert),
+                        BitwiseAnd(
+                            _module.AddInstruction(SpirvOp.Not, _uintType, mask),
+                            source));
+                    break;
+                }
+                case "VAlignbitB32":
+                case "VAlignbyteB32":
+                {
+                    var high = GetRawSource(instruction, 0);
+                    var low = GetRawSource(instruction, 1);
+                    // ({S0,S1} >> shift)[31:0]; ALIGNBYTE shifts by whole bytes of S2[1:0].
+                    var shift = instruction.Opcode == "VAlignbyteB32"
+                        ? ShiftLeftLogical(BitwiseAnd(GetRawSource(instruction, 2), UInt(3)), UInt(3))
+                        : BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    var lowPart = ShiftRightLogical(low, shift);
+                    var inverse = BitwiseAnd(ISubU(UInt(32), shift), UInt(31));
+                    var highPartRaw = ShiftLeftLogical(high, inverse);
+                    var highPart = SelectU(IsNotZero(shift), highPartRaw, UInt(0));
+                    result = BitwiseOr(lowPart, highPart);
+                    break;
+                }
+                case "VCvtPkrtzF16F32":
+                {
+                    var first = TruncateFloat32ForPack(GetFloatSource(instruction, 0));
+                    var second = TruncateFloat32ForPack(GetFloatSource(instruction, 1));
+                    var vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        first,
+                        second);
+                    result = Ext(58, _uintType, vector);
+                    StorePackedHalf(
+                        destination,
+                        vector);
+                    break;
+                }
+                case "VCvtPkU16U32":
+                {
+                    var low = Ext(38, _uintType, GetRawSource(instruction, 0), UInt(0xFFFF));
+                    var high = Ext(38, _uintType, GetRawSource(instruction, 1), UInt(0xFFFF));
+                    result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+                    break;
+                }
+                case "VCvtPkI16I32":
+                {
+                    var minimum = Bitcast(_intType, UInt(0xFFFF8000));
+                    var maximum = Bitcast(_intType, UInt(0x7FFF));
+                    var low = Ext(45, _intType, Bitcast(_intType, GetRawSource(instruction, 0)), minimum, maximum);
+                    var high = Ext(45, _intType, Bitcast(_intType, GetRawSource(instruction, 1)), minimum, maximum);
+                    result = BitwiseOr(BitwiseAnd(Bitcast(_uintType, low), UInt(0xFFFF)),
+                        ShiftLeftLogical(Bitcast(_uintType, high), UInt(16)));
+                    break;
+                }
+                case "VCvtPknormI16F32":
+                case "VCvtPknormU16F32":
+                {
+                    var vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        GetFloatSource(instruction, 0),
+                        GetFloatSource(instruction, 1));
+                    // GLSL.std.450 PackSnorm2x16 / PackUnorm2x16 match the
+                    // RDNA saturated normalized conversion and packing rules.
+                    result = Ext(
+                        instruction.Opcode == "VCvtPknormI16F32" ? 56u : 57u,
+                        _uintType,
+                        vector);
+                    break;
+                }
+
+                case "VPkAddI16":
+                case "VPkSubI16":
+                    result = EmitPackedIntegerAddSubtract(instruction);
+                    break;
+                case "VPkAddF16":
+                case "VPkMulF16":
+                case "VPkMinF16":
+                case "VPkMaxF16":
+                case "VPkFmaF16":
+                    if (!TryEmitPackedF16(instruction, out result, out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                case "VPkMadI16":
+                case "VPkMadU16":
+                case "VPkMulLoU16":
+                case "VPkLshlrevB16":
+                case "VPkLshrrevB16":
+                case "VPkAshrrevI16":
+                case "VPkAddU16":
+                case "VPkSubU16":
+                case "VPkMaxI16":
+                case "VPkMinI16":
+                case "VPkMaxU16":
+                case "VPkMinU16":
+                    if (instruction.Control is Gen5Vop3pControl { Clamp: true } &&
+                        instruction.Opcode is "VPkMulLoU16" or "VPkLshlrevB16" or "VPkLshrrevB16" or "VPkAshrrevI16")
+                    {
+                        error = $"{instruction.Opcode}: a clamped result is not supported";
+                        return false;
+                    }
+
+                    result = EmitPackedI16Arithmetic(instruction);
+                    break;
+                case "VPkFmacF16":
+                    result = EmitPackedF16Fmac(instruction, destination);
+                    break;
+                case "VFmaMixF32":
+                case "VFmaMixloF16":
+                case "VFmaMixhiF16":
+                    if (!TryEmitFmaMix(instruction, destination, out result, out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                case "VMulLoU16":
+                case "VMadU16":
+                case "VMadI16":
+                {
+                    // D.u16 = S0.u16 * S1.u16 (+ S2.u16): the low half of the product; the signed
+                    // multiply-add differs only in how the halves were extended, not in the bits.
+                    if (instruction.Control is Gen5Vop3Control { Clamp: true })
+                    {
+                        error = $"{instruction.Opcode}: clamped 16-bit integer results are not supported";
+                        return false;
+                    }
+
+                    var signed = instruction.Opcode == "VMadI16";
+                    var value = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        GetInt16Source(instruction, 0, signed),
+                        GetInt16Source(instruction, 1, signed));
+                    if (instruction.Opcode != "VMulLoU16")
+                    {
+                        value = IAdd(value, GetInt16Source(instruction, 2, signed));
+                    }
+
+                    result = EmitInt16Result(instruction, destination, value);
+                    break;
+                }
+                case "VMadI32I16":
+                {
+                    // D.i32 = S0.i16 * S1.i16 + S2.i32.
+                    if (instruction.Control is Gen5Vop3Control { Clamp: true })
+                    {
+                        error = $"{instruction.Opcode}: clamped results are not supported";
+                        return false;
+                    }
+
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            GetInt16Source(instruction, 0, signed: true),
+                            GetInt16Source(instruction, 1, signed: true)),
+                        GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VPackB32F16":
+                {
+                    // D[31:16] = S1.f16, D[15:0] = S0.f16, each the half op_sel picks; the bits move unconverted
+                    // apart from the f16 input modifiers: abs clears the sign bit, neg flips it.
+                    var modifiers = instruction.Control as Gen5Vop3Control;
+                    uint Half(int index)
+                    {
+                        var half = GetInt16Source(instruction, index, signed: false);
+                        if ((((modifiers?.AbsoluteMask ?? 0) >> index) & 1) != 0)
+                        {
+                            half = BitwiseAnd(half, UInt(0x7FFF));
+                        }
+
+                        return (((modifiers?.NegateMask ?? 0) >> index) & 1) != 0
+                            ? BitwiseXor(half, UInt(0x8000))
+                            : half;
+                    }
+
+                    result = BitwiseOr(Half(0), ShiftLeftLogical(Half(1), UInt(16)));
+                    break;
+                }
+                case "VAddNcI16":
+                case "VSubNcU16":
+                case "VSubNcI16":
+                case "VLshrrevB16":
+                case "VLshlrevB16":
+                case "VAshrrevI16":
+                case "VMaxU16":
+                case "VMinU16":
+                case "VMaxI16":
+                case "VMinI16":
+                {
+                    if (instruction.Control is Gen5Vop3Control { Clamp: true })
+                    {
+                        error = $"{instruction.Opcode}: clamped 16-bit integer results are not supported";
+                        return false;
+                    }
+
+                    var signed = instruction.Opcode.EndsWith("I16", StringComparison.Ordinal);
+                    var left = GetInt16Source(instruction, 0, signed);
+                    var right = GetInt16Source(instruction, 1, signed);
+                    uint value;
+                    switch (instruction.Opcode)
+                    {
+                        case "VAddNcU16":
+                        case "VAddNcI16":
+                            value = _module.AddInstruction(SpirvOp.IAdd, _uintType, left, right);
+                            break;
+                        case "VSubNcU16":
+                        case "VSubNcI16":
+                            value = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                            break;
+                        case "VLshrrevB16":
+                            value = ShiftRightLogical(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VLshlrevB16":
+                            value = ShiftLeftLogical(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VAshrrevI16":
+                            value = ShiftRightArithmetic(right, BitwiseAnd(left, UInt(15)));
+                            break;
+                        case "VMaxU16":
+                            value = Ext(41, _uintType, left, right);
+                            break;
+                        case "VMinU16":
+                            value = Ext(38, _uintType, left, right);
+                            break;
+                        default:
+                            value = Bitcast(
+                                _uintType,
+                                Ext(
+                                    instruction.Opcode == "VMaxI16" ? 42u : 39u,
+                                    _intType,
+                                    Bitcast(_intType, left),
+                                    Bitcast(_intType, right)));
+                            break;
+                    }
+
+                    result = EmitInt16Result(instruction, destination, value);
+                    break;
+                }
+                default:
+                    error = $"unsupported vector opcode {instruction.Opcode}";
+                    return false;
+            }
+
+            if (instruction.Control is Gen5DppControl dpp)
+            {
+                result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    IsDppWriteEnabled(dpp),
+                    result,
+                    LoadV(destination));
+            }
+
+            if (instruction.Control is Gen5SdwaControl destinationControl &&
+                destinationControl.ScalarDestination is null)
+            {
+                result = ApplySdwaDestination(
+                    destinationControl,
+                    result,
+                    LoadV(destination));
+            }
+
+            StoreV(destination, result);
+            return true;
+        }
+
+        // V_MOVREL*_B32: register-relative moves. M0 is added at run time to the
+        // source and/or destination register number encoded in the instruction,
+        // which is how shader compilers implement a dynamically indexed array
+        // that stayed in registers instead of being spilled to memory. Astro Bot
+        // ships pixel shaders that index a small register-resident table this
+        // way; without this the whole shader fails to translate.
+        //
+        //   V_MOVRELS_B32     vdst              = vgpr[src0 + M0]
+        //   V_MOVRELD_B32     vgpr[vdst + M0]   = src0
+        //   V_MOVRELSD_B32    vgpr[vdst + M0]   = vgpr[src0 + M0]
+        //   V_MOVRELSD_2_B32  vgpr[vdst + M0[25:16]] = vgpr[src0 + M0[9:0]]
+        //
+        // The relative forms address the VGPR file relative to the wave's own
+        // allocation base, which is exactly what the private register array
+        // models, so the encoded number and M0 simply add.
+        private bool TryEmitMoveRelative(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count == 0)
+            {
+                error = $"missing source for {instruction.Opcode}";
+                return false;
+            }
+
+            var m0 = LoadS(M0ScalarRegister);
+            if (TryGetMoveRelativeOffsets(instruction.Pc, out var offsets))
+            {
+                return TryEmitBoundedMoveRelative(instruction, destination, m0, offsets, out error);
+            }
+
+            uint sourceOffset;
+            uint destinationOffset;
+            if (instruction.Opcode == "VMovrelsd2B32")
+            {
+                sourceOffset = BitwiseAnd(m0, UInt(0x3FF));
+                destinationOffset = BitwiseAnd(ShiftRightLogical(m0, UInt(16)), UInt(0x3FF));
+            }
+            else
+            {
+                sourceOffset = m0;
+                destinationOffset = m0;
+            }
+
+            uint value;
+            if (instruction.Opcode == "VMovreldB32")
+            {
+                // Only the destination is relative here; src0 is an ordinary
+                // operand and may be an SGPR or an inline/literal constant.
+                value = GetRawSource(instruction, 0);
+            }
+            else
+            {
+                var source = instruction.Sources[0];
+                if (source.Kind != Gen5OperandKind.VectorRegister)
+                {
+                    error = $"{instruction.Opcode} source must be a vector register";
+                    return false;
+                }
+
+                value = LoadVDynamic(IAdd(UInt(source.Value), sourceOffset));
+            }
+
+            if (instruction.Opcode == "VMovrelsB32")
+            {
+                StoreV(destination, value);
+                return true;
+            }
+
+            StoreVDynamic(IAdd(UInt(destination), destinationOffset), value);
+            return true;
+        }
+
+        private IReadOnlyDictionary<uint, uint[]>? _moveRelativeOffsets;
+
+        // A relative move whose M0 values are known picks among those registers with
+        // constant register numbers, so the VGPR array is never indexed at run time and
+        // the driver can keep it in hardware registers instead of scratch memory.
+        private bool TryEmitBoundedMoveRelative(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint m0,
+            uint[] offsets,
+            out string error)
+        {
+            error = string.Empty;
+            uint value;
+            if (instruction.Opcode == "VMovreldB32")
+            {
+                value = GetRawSource(instruction, 0);
+            }
+            else
+            {
+                var source = instruction.Sources[0];
+                if (source.Kind != Gen5OperandKind.VectorRegister)
+                {
+                    error = $"{instruction.Opcode} source must be a vector register";
+                    return false;
+                }
+
+                value = LoadV((source.Value + offsets[0]) & (VectorRegisterCount - 1));
+                for (var index = 1; index < offsets.Length; index++)
+                {
+                    value = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.IEqual, _boolType, m0, UInt(offsets[index])),
+                        LoadV((source.Value + offsets[index]) & (VectorRegisterCount - 1)),
+                        value);
+                }
+            }
+
+            if (instruction.Opcode == "VMovrelsB32")
+            {
+                StoreV(destination, value);
+                return true;
+            }
+
+            var active = Load(_boolType, _exec);
+            foreach (var offset in offsets)
+            {
+                var register = (destination + offset) & (VectorRegisterCount - 1);
+                var selected = LogicalAnd(active, _module.AddInstruction(SpirvOp.IEqual, _boolType, m0, UInt(offset)));
+                StoreV(register, _module.AddInstruction(SpirvOp.Select, _uintType, selected, value, LoadV(register)), guardWithExec: false);
+            }
+
+            return true;
+        }
+
+        // Packed f16 (VOP3P) arithmetic. Each source register holds two f16 values,
+        // one per result lane. Every f16<->f32 conversion is done with the explicit
+        // integer sequences below (EmitHalfToFloat / EmitFloatToHalf) instead of
+        // GLSL UnpackHalf2x16 / PackHalf2x16, whose subnormal and rounding behaviour
+        // is implementation-defined without float-controls execution modes. The two
+        // lanes are computed independently: each operand half is widened exactly to
+        // f32, op_sel/op_sel_hi pick the source half and neg_lo/neg_hi negate it, the
+        // op runs in f32, and the result is rounded back to f16 with round-to-nearest-
+        // even. For add and mul this is bit-exact to a true f16 op (the f32 result
+        // rounds losslessly to f16 by the double-rounding theorem; a f16 product even
+        // fits in f32 exactly). min/max carry no rounding, so they are exact once the
+        // conversions are. v_pk_fma_f16 cannot be reproduced by a plain f32
+        // multiply-add plus a pack (that double-rounds), so it goes through the
+        // round-to-odd sequence in EmitPackedF16FusedMultiplyAdd instead.
+        private bool TryEmitPackedF16(
+            Gen5ShaderInstruction instruction,
+            out uint result,
+            out string error)
+        {
+            result = 0;
+            error = string.Empty;
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                error = $"missing vop3p control for {instruction.Opcode}";
+                return false;
+            }
+
+            if (TryEmitNativePackedF16(instruction, control, out result))
+            {
+                return true;
+            }
+
+            var low = EmitPackedF16Lane(instruction, control, highLane: false);
+            var high = EmitPackedF16Lane(instruction, control, highLane: true);
+            result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+            return true;
+        }
+
+        // The packed 16-bit integer ops (V_PK_MAD/MUL_LO/ADD/SUB/LSHLREV/LSHRREV/ASHRREV/MAX/MIN_x16) operate
+        // on the selected 16-bit halves of the sources. The result is modulo 16 bits in each lane, so the
+        // signed and unsigned forms of the arithmetic ops are the same bits; max, min and the arithmetic
+        // shift see the sign-extended halves of the signed forms. The reverse shifts take the count from
+        // the low four bits of src0 and shift src1. The clamp bit saturates the add, subtract and multiply-add
+        // results to the 16-bit range, as EmitPackedIntegerAddSubtract does for V_PK_ADD_I16 and V_PK_SUB_I16; it
+        // cannot change a max or min. The negate bits flip bit 15 of the selected half as they do for the float
+        // forms: compilers write the integer -1 as the literal 0x7FFF with the bit set.
+        private uint EmitPackedI16Arithmetic(Gen5ShaderInstruction instruction)
+        {
+            var control = (Gen5Vop3pControl)instruction.Control!;
+            var opcode = instruction.Opcode;
+            var signed = opcode.EndsWith("I16", StringComparison.Ordinal);
+            var sourceCount = opcode is "VPkMadI16" or "VPkMadU16" ? 3 : 2;
+            var raw = new uint[sourceCount];
+            for (var index = 0; index < sourceCount; index++)
+            {
+                raw[index] = GetRawSource(instruction, index);
+            }
+
+            uint Operation(uint[] half) => opcode switch
+            {
+                "VPkAddI16" or "VPkAddU16" => IAdd(half[0], half[1]),
+                "VPkSubI16" or "VPkSubU16" => ISubU(half[0], half[1]),
+                "VPkMulLoU16" => _module.AddInstruction(SpirvOp.IMul, _uintType, half[0], half[1]),
+                "VPkMadI16" or "VPkMadU16" => IAdd(
+                    _module.AddInstruction(SpirvOp.IMul, _uintType, half[0], half[1]),
+                    half[2]),
+                "VPkLshlrevB16" => ShiftLeftLogical(half[1], BitwiseAnd(half[0], UInt(15))),
+                "VPkLshrrevB16" => ShiftRightLogical(half[1], BitwiseAnd(half[0], UInt(15))),
+                "VPkAshrrevI16" => ShiftRightArithmetic(half[1], BitwiseAnd(half[0], UInt(15))),
+                "VPkMaxI16" => Bitcast(_uintType, Ext(42, _intType, Bitcast(_intType, half[0]), Bitcast(_intType, half[1]))),
+                "VPkMinI16" => Bitcast(_uintType, Ext(39, _intType, Bitcast(_intType, half[0]), Bitcast(_intType, half[1]))),
+                "VPkMaxU16" => Ext(41, _uintType, half[0], half[1]),
+                _ => Ext(38, _uintType, half[0], half[1]),
+            };
+
+            uint Lane(uint selectMask, uint negateMask)
+            {
+                var half = new uint[sourceCount];
+                for (var index = 0; index < sourceCount; index++)
+                {
+                    var selected = BitwiseAnd(
+                        ((selectMask >> index) & 1) != 0
+                            ? ShiftRightLogical(raw[index], UInt(16))
+                            : raw[index],
+                        UInt(0xFFFF));
+                    if (((negateMask >> index) & 1) != 0)
+                    {
+                        selected = BitwiseXor(selected, UInt(0x8000));
+                    }
+
+                    half[index] = signed
+                        ? ShiftRightArithmetic(ShiftLeftLogical(selected, UInt(16)), UInt(16))
+                        : selected;
+                }
+
+                var value = Operation(half);
+                if (control.Clamp)
+                {
+                    // The halves were widened to 32 bits, so the exact result saturates.
+                    value = opcode switch
+                    {
+                        "VPkAddU16" or "VPkMadU16" => Ext(38, _uintType, value, UInt(0xFFFF)),
+                        "VPkSubU16" => Bitcast(_uintType, Ext(42, _intType, Bitcast(_intType, value), Bitcast(_intType, UInt(0)))),
+                        "VPkMadI16" => Bitcast(_uintType, Ext(45, _intType, Bitcast(_intType, value),
+                            Bitcast(_intType, UInt(0xFFFF8000)), Bitcast(_intType, UInt(0x7FFF)))),
+                        _ => value,
+                    };
+                }
+
+                return BitwiseAnd(value, UInt(0xFFFF));
+            }
+
+            return BitwiseOr(
+                Lane(control.OpSelMask, control.NegLoMask),
+                ShiftLeftLogical(Lane(control.OpSelHiMask, control.NegHiMask), UInt(16)));
+        }
+
+        // V_FMA_MIX_F32 / _MIXLO_F16 / _MIXHI_F16 (VOP3P opcodes 0x20 / 0x21 /
+        // 0x22). Unlike the packed v_pk_* ops these compute a single f32
+        // fma(a, b, c): each of the three sources is *independently* read as
+        // either a full f32 register/constant or one f16 half widened to f32,
+        // selected per operand by op_sel_hi (read as f16 when set) and op_sel
+        // (which half feeds the f32). For the mix ops the VOP3P neg_hi field is
+        // the absolute-value modifier and neg negates, applied abs-then-neg to
+        // match the hardware and shadPS4's GetSrcMix. _MIXLO / _MIXHI round the
+        // f32 result back to f16 and write it into the low / high 16 bits of
+        // vdst, leaving the other half intact.
+        private bool TryEmitFmaMix(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            out uint result,
+            out string error)
+        {
+            result = 0;
+            error = string.Empty;
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                error = $"missing vop3p control for {instruction.Opcode}";
+                return false;
+            }
+
+            var product = Bitcast(
+                _uintType,
+                Ext(
+                    50,
+                    _floatType,
+                    EmitFmaMixOperand(instruction, control, 0),
+                    EmitFmaMixOperand(instruction, control, 1),
+                    EmitFmaMixOperand(instruction, control, 2)));
+            if (control.Clamp)
+            {
+                product = EmitClampToUnitInterval(product);
+            }
+
+            if (instruction.Opcode == "VFmaMixF32")
+            {
+                result = product;
+                return true;
+            }
+
+            // _MIXLO / _MIXHI: narrow to f16 and merge into one half of vdst.
+            var half = EmitFloatToHalf(product);
+            var existing = LoadV(destination);
+            result = instruction.Opcode == "VFmaMixloF16"
+                ? BitwiseOr(BitwiseAnd(existing, UInt(0xFFFF_0000)), half)
+                : BitwiseOr(
+                    BitwiseAnd(existing, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(half, UInt(16)));
+            return true;
+        }
+
+        // Half selection applies to registers and literals. Inline constants stay f32.
+        // Apply absolute value before negation for mixed-precision instructions.
+        private uint EmitFmaMixOperand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int index)
+        {
+            var source = instruction.Sources[index];
+            var readAsHalf =
+                ((control.OpSelHiMask >> index) & 1) != 0 &&
+                source.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister
+                    or Gen5OperandKind.LiteralConstant;
+
+            uint value;
+            if (readAsHalf)
+            {
+                value = Bitcast(_floatType,
+                    EmitHalfToFloat(GetRawSource(instruction, index), ((control.OpSelMask >> index) & 1) != 0));
+            }
+            else
+            {
+                value = GetFloatSource(instruction, index);
+            }
+
+            if (((control.NegHiMask >> index) & 1) != 0)
+            {
+                value = Ext(4, _floatType, value);
+            }
+
+            if (((control.NegLoMask >> index) & 1) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
+            }
+
+            return value;
+        }
+
+        // Computes one result lane (low or high) as a packed 16-bit f16 value.
+        // The op runs in f32 and its result is narrowed back to f16 exactly (see
+        // EmitFloatToHalf). When the clamp modifier is set the pre-narrowing f32
+        // value is saturated to [0, 1] first; because 0.0 and 1.0 are exact in both
+        // f32 and f16 and the clamp is monotonic, clamping before the narrowing
+        // gives the same f16 the hardware produces by clamping the f16 result. For
+        // the fused multiply-add the pre-narrowing value is the round-to-odd f32
+        // from EmitPackedF16FusedMultiplyAdd, and round-to-odd preserves that
+        // equivalence through the final round-to-nearest-even.
+        private uint EmitPackedF16Lane(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            bool highLane)
+        {
+            var left = EmitPackedF16Operand(instruction, control, 0, highLane);
+            var right = EmitPackedF16Operand(instruction, control, 1, highLane);
+            uint value;
+            if (instruction.Opcode == "VPkFmaF16")
+            {
+                var addend = EmitPackedF16Operand(instruction, control, 2, highLane);
+                value = EmitPackedF16FusedMultiplyAdd(left, right, addend);
+            }
+            else
+            {
+                value = Bitcast(_uintType, instruction.Opcode switch
+                {
+                    "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, _floatType, left, right),
+                    "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _floatType, left, right),
+                    "VPkMinF16" => EmitPackedF16MinMax(left, right, isMax: false),
+                    "VPkMaxF16" => EmitPackedF16MinMax(left, right, isMax: true),
+                    _ => left,
+                });
+            }
+
+            if (control.Clamp)
+            {
+                value = EmitClampToUnitInterval(value);
+            }
+
+            return EmitFloatToHalf(value);
+        }
+
+        // V_PK_FMAC_F16 (VOP2 0x3C): each result half is a fused f16 multiply-add
+        // whose addend is the matching half of the old destination, so the packed
+        // register is read as D = S0 * S1 + D for both lanes at once.
+        private uint EmitPackedF16Fmac(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            var accumulator = LoadV(destination);
+            var low = EmitPackedF16FmacLane(instruction, accumulator, highLane: false);
+            var high = EmitPackedF16FmacLane(instruction, accumulator, highLane: true);
+            return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+        }
+
+        private uint EmitPackedF16FmacLane(
+            Gen5ShaderInstruction instruction,
+            uint accumulator,
+            bool highLane)
+        {
+            var left = EmitPackedF16Half(GetPackedF16Source(instruction, 0), highLane);
+            var right = EmitPackedF16Half(GetPackedF16Source(instruction, 1), highLane);
+            var addend = EmitPackedF16Half(accumulator, highLane);
+            return EmitFloatToHalf(
+                EmitPackedF16FusedMultiplyAdd(left, right, addend));
+        }
+
+        // A source of a packed f16 instruction is a pair of halves. A float inline constant is its f16 value in the low half
+        // and zero in the high half; registers, literals and integer inline constants are their 32-bit value.
+        private uint GetPackedF16Source(Gen5ShaderInstruction instruction, int index) =>
+            instruction.Sources[index] is { Kind: Gen5OperandKind.EncodedConstant, Value: >= 240 and <= 248 } constant
+                ? UInt(constant.Value switch
+                {
+                    240 => 0x3800u,
+                    241 => 0xB800u,
+                    242 => 0x3C00u,
+                    243 => 0xBC00u,
+                    244 => 0x4000u,
+                    245 => 0xC000u,
+                    246 => 0x4400u,
+                    247 => 0xC400u,
+                    _ => 0x3118u,
+                })
+                : GetRawSource(instruction, index);
+
+        private uint EmitPackedF16Half(uint raw, bool highLane) =>
+            Bitcast(_floatType, EmitHalfToFloat(raw, highLane));
+
+        // Saturates an f32 bit pattern to [0, 1] the way the VOP3P clamp modifier
+        // does: below 0 (and NaN, since the ordered compare is false for it) becomes
+        // 0, above 1 becomes 1. Ordered compares match the hardware's NaN-to-zero
+        // behaviour without a separate IsNan test.
+        private uint EmitClampToUnitInterval(uint valueBits)
+        {
+            var value = Bitcast(_floatType, valueBits);
+            var aboveZero = _module.AddInstruction(SpirvOp.FOrdGreaterThan, _boolType, value, Float(0));
+            var lowerBounded = _module.AddInstruction(SpirvOp.Select, _floatType, aboveZero, value, Float(0));
+            var belowOne = _module.AddInstruction(SpirvOp.FOrdLessThan, _boolType, lowerBounded, Float(1));
+            var clamped = _module.AddInstruction(SpirvOp.Select, _floatType, belowOne, lowerBounded, Float(1));
+            return Bitcast(_uintType, clamped);
+        }
+
+        // Fused f16 multiply-add with a single rounding, emulated in f32 without the
+        // Float16 capability. The f32 product of two widened f16 values is exact
+        // (11-bit significands, and the exponent stays inside the f32 normal range:
+        // any non-zero product magnitude is in [2^-48, 2^33]), so only the addition
+        // rounds. An f32 add then an f16 pack would round twice; instead the add is
+        // corrected to round-to-odd, which a following round-to-nearest-even pack
+        // turns into the exactly-once-rounded fused result (innocuous double rounding
+        // holds because f32 carries 24 significand bits >= 11 + 2).
+        //
+        // sum = RN(product + addend); Knuth's 2Sum recovers the exact residual
+        // (product + addend) - sum from four more RN ops. 2Sum is exact for any two
+        // finite f32 inputs; no intermediate here can overflow (|product| < 2^33,
+        // |addend| < 2^16) and none can enter the f32 subnormal range (every finite
+        // value in play is a multiple of 2^-48 by construction), so implementation
+        // f32 denorm-flush modes never see a denormal. If the residual says the sum
+        // was inexact and the sum's significand is even, step one ulp towards the
+        // true value: consecutive floats have consecutive sign-magnitude encodings,
+        // so that neighbour is the enclosing float with the odd significand.
+        //
+        // Inf/NaN inputs make the residual NaN (e.g. sum - addend = Inf - Inf); the
+        // ordered compare below is then false and the IEEE sum passes through
+        // unchanged. A residual of zero also covers the exact-sum case, where the
+        // parity fix must not fire. Returns the round-to-odd f32 bit pattern.
+        private uint EmitPackedF16FusedMultiplyAdd(uint left, uint right, uint addend)
+        {
+            var product = EmitPreciseFloat(SpirvOp.FMul, left, right);
+            var sum = EmitPreciseFloat(SpirvOp.FAdd, product, addend);
+
+            var productPart = EmitPreciseFloat(SpirvOp.FSub, sum, addend);
+            var addendPart = EmitPreciseFloat(SpirvOp.FSub, sum, productPart);
+            var productError = EmitPreciseFloat(SpirvOp.FSub, product, productPart);
+            var addendError = EmitPreciseFloat(SpirvOp.FSub, addend, addendPart);
+            var residual = EmitPreciseFloat(SpirvOp.FAdd, productError, addendError);
+
+            var sumBits = Bitcast(_uintType, sum);
+            var residualBits = Bitcast(_uintType, residual);
+            var inexact = _module.AddInstruction(
+                SpirvOp.FOrdNotEqual, _boolType, residual, Float(0));
+            var evenSignificand = Equal(BitwiseAnd(sumBits, UInt(1)), 0);
+            var adjust = _module.AddInstruction(
+                SpirvOp.LogicalAnd, _boolType, inexact, evenSignificand);
+
+            // Residual sign relative to the sum picks the step direction: same sign
+            // means the true value lies away from zero (encoding + 1), opposite sign
+            // means towards zero (encoding - 1). The sum cannot be zero here (any
+            // inexact sum has magnitude >= 2^-48) and cannot be the largest finite
+            // value (its significand is odd), so the step never crosses zero or Inf.
+            var towardZero = IsNotZero(
+                BitwiseAnd(BitwiseXor(sumBits, residualBits), UInt(0x8000_0000)));
+            var stepped = SelectU(
+                towardZero,
+                ISubU(sumBits, UInt(1)),
+                IAdd(sumBits, UInt(1)));
+            return SelectU(adjust, stepped, sumBits);
+        }
+
+        // A float op the driver must evaluate exactly as written. The 2Sum
+        // residual above is error-free only op by op; without NoContraction
+        // driver compilers fold the sequence (e.g. contract product+sum into an
+        // f32 fma and simplify the rebuilt terms), collapsing the residual to
+        // zero. Observed on AMD RDNA3 Windows: the pinned midpoint case decays
+        // to the double-rounded result unless every op in the chain is marked.
+        private uint EmitPreciseFloat(SpirvOp operation, uint left, uint right)
+        {
+            var value = _module.AddInstruction(operation, _floatType, left, right);
+            _module.AddDecoration(value, SpirvDecoration.NoContraction);
+            return value;
+        }
+
+        // Reads source `index`, selects the half feeding this lane (op_sel / op_sel_hi),
+        // widens it exactly to f32 and applies the lane's negate modifier (neg_lo / neg_hi).
+        private uint EmitPackedF16Operand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int index,
+            bool highLane)
+        {
+            var raw = GetPackedF16Source(instruction, index);
+            var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
+            var value = Bitcast(_floatType, EmitHalfToFloat(raw, ((selectMask >> index) & 1) != 0));
+            var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
+            if (((negateMask >> index) & 1) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
+            }
+
+            return value;
+        }
+
+        // fminnum_like / fmaxnum_like: if one operand is NaN return the other; if both
+        // are NaN return a NaN; otherwise the ordered smaller/larger. The ordering of
+        // -0/+0 is unspecified under these opcodes, so the ordered compare is enough.
+        private uint EmitPackedF16MinMax(uint left, uint right, bool isMax, uint type = 0, uint boolType = 0)
+        {
+            type = type == 0 ? _floatType : type;
+            boolType = boolType == 0 ? _boolType : boolType;
+            var compare = _module.AddInstruction(
+                isMax ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan,
+                boolType,
+                left,
+                right);
+            var numeric = _module.AddInstruction(
+                SpirvOp.Select, type, compare, left, right);
+            var leftNan = _module.AddInstruction(SpirvOp.IsNan, boolType, left);
+            var rightNan = _module.AddInstruction(SpirvOp.IsNan, boolType, right);
+            var withRight = _module.AddInstruction(
+                SpirvOp.Select, type, rightNan, left, numeric);
+            return _module.AddInstruction(
+                SpirvOp.Select, type, leftNan, right, withRight);
+        }
+
+        private uint ReadMinimumHalfBits(Gen5ShaderInstruction instruction, int sourceIndex)
+        {
+            var operand = instruction.Sources[sourceIndex];
+            uint bits;
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                Gen5InlineConstants.TryDecode(operand.Value, out var inline))
+            {
+                var number = operand.Value switch
+                {
+                    >= 128 and <= 192 => (float)(operand.Value - 128),
+                    >= 193 and <= 208 => -(float)(operand.Value - 192),
+                    _ => BitConverter.UInt32BitsToSingle(inline),
+                };
+                bits = UInt(BitConverter.HalfToUInt16Bits((Half)number));
+            }
+            else
+            {
+                bits = GetRawSource(instruction, sourceIndex, applySdwaIntegerModifiers: false);
+                if (instruction.Control is Gen5Vop3Control selection &&
+                    (selection.OperandSelect & (1u << sourceIndex)) != 0)
+                    bits = ShiftRightLogical(bits, UInt(16));
+                bits = BitwiseAnd(bits, UInt(0xFFFF));
+            }
+            var (absolute, negate) = instruction.Control switch
+            {
+                Gen5Vop3Control control => (control.AbsoluteMask, control.NegateMask),
+                Gen5SdwaControl control => (control.AbsoluteMask, control.NegateMask),
+                Gen5DppControl control => (control.AbsoluteMask, control.NegateMask),
+                _ => (0u, 0u),
+            };
+            if ((absolute & (1u << sourceIndex)) != 0) bits = BitwiseAnd(bits, UInt(0x7FFF));
+            if ((negate & (1u << sourceIndex)) != 0) bits = BitwiseXor(bits, UInt(0x8000));
+            return bits;
+        }
+
+        private uint MinimumHalfBits(uint left, uint right)
+        {
+            var leftMagnitude = BitwiseAnd(left, UInt(0x7FFF));
+            var rightMagnitude = BitwiseAnd(right, UInt(0x7FFF));
+            var leftNan = UCmp(SpirvOp.UGreaterThan, leftMagnitude, UInt(0x7C00));
+            var rightNan = UCmp(SpirvOp.UGreaterThan, rightMagnitude, UInt(0x7C00));
+            uint Ordered(uint value) => BitwiseXor(value,
+                SelectU(IsNotZero(BitwiseAnd(value, UInt(0x8000))), UInt(0xFFFF), UInt(0x8000)));
+            var result = SelectU(UCmp(SpirvOp.ULessThan, Ordered(left), Ordered(right)), left, right);
+            result = SelectU(rightNan, left, result);
+            result = SelectU(leftNan, right, result);
+            if (_request.IeeeMode)
+            {
+                var leftSignaling = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType,
+                    leftNan, Equal(BitwiseAnd(left, UInt(0x200)), 0));
+                var rightSignaling = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType,
+                    rightNan, Equal(BitwiseAnd(right, UInt(0x200)), 0));
+                result = SelectU(rightSignaling, BitwiseOr(right, UInt(0x200)), result);
+                result = SelectU(leftSignaling, BitwiseOr(left, UInt(0x200)), result);
+            }
+            return result;
+        }
+
+        private uint EmitMinimumHalfResult(Gen5ShaderInstruction instruction, uint destination, bool ternary)
+        {
+            var bits = MinimumHalfBits(ReadMinimumHalfBits(instruction, 0), ReadMinimumHalfBits(instruction, 1));
+            if (ternary) bits = MinimumHalfBits(bits, ReadMinimumHalfBits(instruction, 2));
+            var (outputModifier, clamp) = instruction.Control switch
+            {
+                Gen5Vop3Control vop3 => (vop3.OutputModifier, vop3.Clamp),
+                Gen5SdwaControl sdwa => (sdwa.OutputModifier, sdwa.Clamp),
+                _ => (0u, false),
+            };
+            var modifier = _request.IeeeMode ? 0u : outputModifier;
+            if (modifier != 0)
+            {
+                var scaled = _module.AddInstruction(SpirvOp.FMul, _floatType,
+                    Bitcast(_floatType, EmitHalfToFloat(bits)), Float(modifier == 1 ? 2 : modifier == 2 ? 4 : 0.5f));
+                var converted = EmitFloatToHalf(Bitcast(_uintType, scaled));
+                bits = SelectU(UCmp(SpirvOp.UGreaterThan, BitwiseAnd(bits, UInt(0x7FFF)), UInt(0x7C00)), bits, converted);
+            }
+            if (clamp)
+            {
+                var negative = IsNotZero(BitwiseAnd(bits, UInt(0x8000)));
+                var nan = UCmp(SpirvOp.UGreaterThan, BitwiseAnd(bits, UInt(0x7FFF)), UInt(0x7C00));
+                bits = SelectU(_module.AddInstruction(SpirvOp.LogicalOr, _boolType, negative, nan), UInt(0),
+                    SelectU(UCmp(SpirvOp.UGreaterThan, bits, UInt(0x3C00)), UInt(0x3C00), bits));
+            }
+            return EmitHalfResult(instruction, destination, bits);
+        }
+
+        // Widens an f16 value held in the low 16 bits of `halfBits` (the high 16 bits when `high` is set) to an f32 bit
+        // pattern, exactly (subnormals normalised, Inf/NaN and signed zero preserved).
+        // The exponent and mantissa move into place and the exponent is re-biased;
+        // Inf/NaN take a second re-bias to the all-ones exponent. A subnormal m becomes
+        // 2^-14 * (1 + m / 1024) - 2^-14: both floats are normal and their difference
+        // m * 2^-24 is representable, so the subtraction is exact even when the driver
+        // flushes denormals.
+        private uint EmitHalfToFloat(uint halfBits, bool high = false)
+        {
+            if (_request.NativeFloat16Conversions && !_module.TryGetConstantValue(halfBits, out _))
+            {
+                return EmitNativeHalfToFloat(halfBits, high);
+            }
+
+            if (high)
+            {
+                halfBits = ShiftRightLogical(halfBits, UInt(16));
+            }
+
+            var magnitude = ShiftLeftLogical(BitwiseAnd(halfBits, UInt(0x7FFF)), UInt(13));
+            var exponent = BitwiseAnd(magnitude, UInt(0x0F80_0000));
+            var rebiased = IAdd(magnitude, UInt(112u << 23));
+            var infinityNan = IAdd(rebiased, UInt(112u << 23));
+            var subnormal = Bitcast(_uintType, _module.AddInstruction(SpirvOp.FSub, _floatType,
+                Bitcast(_floatType, IAdd(rebiased, UInt(1u << 23))), Float(1f / 16384f)));
+            var widened = SelectU(
+                Equal(exponent, 0),
+                subnormal,
+                SelectU(Equal(exponent, 0x0F80_0000), infinityNan, rebiased));
+            return BitwiseOr(widened, ShiftLeftLogical(BitwiseAnd(halfBits, UInt(0x8000)), UInt(16)));
+        }
+
+        // Narrows an f32 bit pattern to an f16 value in the low 16 bits, rounding to
+        // nearest even (subnormals, overflow-to-Inf and NaN/Inf handled). Mirrors the
+        // branchless FloatToHalf reference validated exhaustively against System.Half.
+        // A NaN becomes the quiet NaN of its sign, 0x7E00.
+        private uint EmitFloatToHalf(uint bits)
+        {
+            if (_request.NativeFloat16Conversions && !_module.TryGetConstantValue(bits, out _))
+            {
+                return EmitNativeFloatToHalf(bits);
+            }
+
+            var sign = BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000));
+            var absolute = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+
+            var isInfinityNan = UCmp(SpirvOp.UGreaterThanEqual, absolute, UInt(0x7F80_0000));
+            var isNan = UCmp(SpirvOp.UGreaterThan, absolute, UInt(0x7F80_0000));
+            var infinityNan = BitwiseOr(
+                BitwiseOr(sign, UInt(0x7C00)),
+                SelectU(isNan, UInt(0x200), UInt(0)));
+
+            var exponent = ShiftRightLogical(absolute, UInt(23));
+            var mantissa = BitwiseAnd(absolute, UInt(0x7F_FFFF));
+            var significand = BitwiseOr(mantissa, UInt(0x80_0000));
+
+            // Normal path: round the 24-bit significand down to 11 bits (>> 13) with
+            // round-to-nearest-even; the carry folds naturally into the exponent.
+            var roundBit = BitwiseAnd(ShiftRightLogical(significand, UInt(13)), UInt(1));
+            var rounded = ShiftRightLogical(IAdd(IAdd(significand, UInt(0xFFF)), roundBit), UInt(13));
+            var halfExponent = ISubU(exponent, UInt(112));
+            var normalBits = IAdd(ShiftLeftLogical(halfExponent, UInt(10)), ISubU(rounded, UInt(0x400)));
+            var normal = SelectU(
+                UCmp(SpirvOp.UGreaterThanEqual, exponent, UInt(113)),
+                SelectU(UCmp(SpirvOp.UGreaterThanEqual, normalBits, UInt(0x7C00)), UInt(0x7C00), normalBits),
+                UInt(0));
+
+            // Subnormal path: value = round(significand >> (126 - exponent)) with RNE.
+            // The shift is clamped to 25 so it stays defined; on this path it is >= 14.
+            var distance = ISubU(UInt(126), exponent);
+            var shift = SelectU(UCmp(SpirvOp.UGreaterThan, distance, UInt(25)), UInt(25), distance);
+            var shiftMask = ISubU(ShiftLeftLogical(UInt(1), shift), UInt(1));
+            var halfWay = ShiftLeftLogical(UInt(1), ISubU(shift, UInt(1)));
+            var lowBits = BitwiseAnd(significand, shiftMask);
+            var quotient = ShiftRightLogical(significand, shift);
+            var roundUp = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                UCmp(SpirvOp.UGreaterThan, lowBits, halfWay),
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    UCmp(SpirvOp.IEqual, lowBits, halfWay),
+                    IsNotZero(BitwiseAnd(quotient, UInt(1)))));
+            var subnormal = IAdd(quotient, SelectU(roundUp, UInt(1), UInt(0)));
+
+            var isSubnormal = UCmp(SpirvOp.ULessThanEqual, exponent, UInt(112));
+            var finite = SelectU(isSubnormal, subnormal, normal);
+            return SelectU(isInfinityNan, infinityNan, BitwiseOr(sign, finite));
+        }
+
+        private uint _halfType;
+        private uint _half2Type;
+
+        // The f16 type of the native conversions. Its first use declares it with the float controls under which OpFConvert
+        // converts as the guest does (the entry point gets their execution modes): round-to-nearest-even, kept denormals,
+        // kept signed zero, infinity and NaN, all for 16-bit floats.
+        private uint HalfType()
+        {
+            if (_halfType == 0)
+            {
+                _module.AddCapability(SpirvCapability.Float16);
+                _module.AddCapability(SpirvCapability.DenormPreserve);
+                _module.AddCapability(SpirvCapability.RoundingModeRte);
+                _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
+                _halfType = _module.TypeFloat(16);
+                _half2Type = _module.TypeVector(_halfType, 2);
+            }
+
+            return _halfType;
+        }
+
+        // EmitHalfToFloat with NativeFloat16Conversions. OpFConvert widens; a NaN keeps its payload as the integer sequence
+        // keeps it, which the device need not do: the half at the top of a word, shifted right arithmetically by 3, has the
+        // sign, exponent and mantissa of the f32 NaN in place, and 0x70000000 fills the rest of its exponent.
+        private uint EmitNativeHalfToFloat(uint bits, bool high)
+        {
+            var half = _module.AddInstruction(SpirvOp.CompositeExtract, HalfType(), Bitcast(_half2Type, bits), high ? 1u : 0u);
+            var top = high ? BitwiseAnd(bits, UInt(0xFFFF_0000)) : ShiftLeftLogical(bits, UInt(16));
+            var nan = BitwiseOr(_module.AddInstruction(SpirvOp.ShiftRightArithmetic, _uintType, top, UInt(3)), UInt(0x7000_0000));
+            return Bitcast(_uintType, _module.AddInstruction(SpirvOp.Select, _floatType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, half),
+                Bitcast(_floatType, nan),
+                _module.AddInstruction(SpirvOp.FConvert, _floatType, half)));
+        }
+
+        // EmitFloatToHalf with NativeFloat16Conversions. OpFConvert rounds to nearest even, makes f16 denormals and overflows
+        // to infinity; a NaN becomes 0x7E00 with its sign, as in the integer sequence.
+        private uint EmitNativeFloatToHalf(uint bits)
+        {
+            var half = HalfType();
+            var value = Bitcast(_floatType, bits);
+            var narrowed = _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type,
+                _module.AddInstruction(SpirvOp.FConvert, half, value), _module.Constant(half, 0));
+            var nan = SelectU(UCmp(SpirvOp.UGreaterThan, bits, UInt(0x7FFF_FFFF)), UInt(0xFE00), UInt(0x7E00));
+            return SelectU(IsNan(value), nan, Bitcast(_uintType, narrowed));
+        }
+
+        private uint HalfConstant(uint bits) => _module.Constant(HalfType(), bits);
+
+        // With NativeFloat16Conversions the f16 add, subtract, multiply, maximum and median are f16 ops where they give the
+        // bits of the f32 forms: one f16 rounding equals the f32 rounding followed by the narrowing (24 >= 2 * 11 + 2
+        // significand bits), and the maximum and median select one of their inputs in either width. The f32 forms must keep
+        // signed zero and NaN (SignedZeroInfNanPreserve for 32 bits), and the abs and neg modifiers are bit operations: an
+        // NVIDIA driver's f16 negation of a NaN can lose its sign, and its compiler folds x + -x of f16 pairs to -0. A maximum or
+        // median with a negated operand keeps the f32 forms, whose NaN result takes the sign of the negation or not as the
+        // driver compiles it. Output scaling, SDWA and DPP keep the f32 forms, as does a constant f16 cannot hold (1/(2 pi))
+        // or a NaN constant, whose widened payload the f32 forms compute with.
+        private bool TryGetNativeHalfSources(Gen5ShaderInstruction instruction, int count, bool selects, out uint[] halves)
+        {
+            halves = new uint[count];
+            if (!_request.NativeFloat16Conversions || !_request.ShaderSignedZeroInfNanPreserveFloat32Supported ||
+                instruction.Control is not (null or Gen5Vop3Control { OutputModifier: 0 }) ||
+                (selects && instruction.Control is Gen5Vop3Control { NegateMask: not 0 }))
+            {
+                return false;
+            }
+
+            var control = instruction.Control as Gen5Vop3Control;
+            bool Bit(uint? mask, int index) => ((mask ?? 0) & (1u << index)) != 0;
+            var constants = new int[count];
+            for (var index = 0; index < count; index++)
+            {
+                if (!TryGetNativeHalfConstant(instruction.Sources[index], Bit(control?.OperandSelect, index), out constants[index]))
+                {
+                    return false;
+                }
+            }
+
+            for (var index = 0; index < count; index++)
+            {
+                var high = Bit(control?.OperandSelect, index);
+                var sign = high ? 0x8000_0000u : 0x8000u;
+                var bits = constants[index] >= 0
+                    ? UInt((uint)constants[index] << (high ? 16 : 0))
+                    : GetRawSource(instruction, index, applySdwaIntegerModifiers: false);
+                if (Bit(control?.AbsoluteMask, index))
+                {
+                    bits = BitwiseAnd(bits, UInt(~sign));
+                }
+
+                if (Bit(control?.NegateMask, index))
+                {
+                    bits = BitwiseXor(bits, UInt(sign));
+                }
+
+                halves[index] = _module.TryGetConstantValue(bits, out var constant)
+                    ? HalfConstant(high ? constant >> 16 : constant & 0xFFFF)
+                    : _module.AddInstruction(SpirvOp.CompositeExtract, HalfType(), Bitcast(_half2Type, bits), high ? 1u : 0u);
+            }
+
+            return true;
+        }
+
+        // The f16 bits of a constant source as GetFloat16Source reads it, or -1 for a register. False when f16 cannot hold
+        // the value or it is a NaN.
+        private static bool TryGetNativeHalfConstant(Gen5Operand operand, bool high, out int bits)
+        {
+            bits = -1;
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                Gen5InlineConstants.TryDecode(operand.Value, out var inline))
+            {
+                var number = operand.Value switch
+                {
+                    >= 128 and <= 192 => operand.Value - 128f,
+                    >= 193 and <= 208 => 192f - operand.Value,
+                    _ => BitConverter.UInt32BitsToSingle(inline),
+                };
+                bits = BitConverter.HalfToUInt16Bits((Half)number);
+                return (float)(Half)number == number;
+            }
+
+            if (operand.Kind == Gen5OperandKind.LiteralConstant)
+            {
+                bits = (int)((high ? operand.Value >> 16 : operand.Value) & 0xFFFF);
+                return (bits & 0x7FFF) <= 0x7C00;
+            }
+
+            return true;
+        }
+
+        // A native f16 result as the low half of a word for EmitHalfResult. The clamp is EmitClampToUnitInterval's; without
+        // it a NaN becomes 0x7E00 with its sign, as the narrowing makes it.
+        private uint EmitNativeHalfResult(Gen5ShaderInstruction instruction, uint destination, uint value)
+        {
+            var clamp = instruction.Control is Gen5Vop3Control { Clamp: true };
+            if (clamp)
+            {
+                value = ClampHalvesToUnitInterval(value, _halfType, _boolType, HalfConstant(0), HalfConstant(0x3C00));
+            }
+
+            var bits = Bitcast(_uintType, _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type, value, HalfConstant(0)));
+            return EmitHalfResult(instruction, destination, clamp ? bits : SelectU(
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, value),
+                BitwiseOr(BitwiseAnd(bits, UInt(0x8000)), UInt(0x7E00)),
+                bits));
+        }
+
+        // TryEmitPackedF16 on f16 pairs under the rules of TryGetNativeHalfSources; V_PK_FMA_F16 keeps its f32 form. A NaN
+        // lane becomes 0x7E00 with its sign, as the narrowing of the lane makes it.
+        private bool TryEmitNativePackedF16(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, out uint result)
+        {
+            result = 0;
+            if (!_request.NativeFloat16Conversions || !_request.ShaderSignedZeroInfNanPreserveFloat32Supported ||
+                instruction.Opcode == "VPkFmaF16" ||
+                (instruction.Opcode is "VPkMaxF16" or "VPkMinF16" && ((control.NegLoMask | control.NegHiMask) & 3) != 0) ||
+                !TryGetNativeHalfPair(instruction, control, 0, out var left) ||
+                !TryGetNativeHalfPair(instruction, control, 1, out var right))
+            {
+                return false;
+            }
+
+            var bool2 = _module.TypeVector(_boolType, 2);
+            var value = instruction.Opcode switch
+            {
+                "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, _half2Type, left, right),
+                "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _half2Type, left, right),
+                _ => EmitPackedF16MinMax(left, right, instruction.Opcode == "VPkMaxF16", _half2Type, bool2),
+            };
+            if (control.Clamp)
+            {
+                result = Bitcast(_uintType, ClampHalvesToUnitInterval(value, _half2Type, bool2,
+                    Bitcast(_half2Type, UInt(0)), Bitcast(_half2Type, UInt(0x3C00_3C00))));
+                return true;
+            }
+
+            var bits = Bitcast(_uintType, value);
+            var nan = _module.AddInstruction(SpirvOp.IsNan, bool2, value);
+            var lanes = BitwiseOr(
+                SelectU(_module.AddInstruction(SpirvOp.CompositeExtract, _boolType, nan, 0u), UInt(0x0000_FFFF), UInt(0)),
+                SelectU(_module.AddInstruction(SpirvOp.CompositeExtract, _boolType, nan, 1u), UInt(0xFFFF_0000), UInt(0)));
+            var quiet = BitwiseOr(BitwiseAnd(bits, UInt(0x8000_8000)), UInt(0x7E00_7E00));
+            result = BitwiseXor(bits, BitwiseAnd(BitwiseXor(bits, quiet), lanes));
+            return true;
+        }
+
+        // A packed source as an f16 pair: op_sel and op_sel_hi pick the half of each lane and neg_lo and neg_hi flip its sign,
+        // on the bits. False for a constant with a NaN half.
+        private bool TryGetNativeHalfPair(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, int index, out uint pair)
+        {
+            pair = 0;
+            var bits = GetPackedF16Source(instruction, index);
+            var low = (control.OpSelMask >> index) & 1;
+            var high = (control.OpSelHiMask >> index) & 1;
+            if (low != 0 || high != 1)
+            {
+                bits = BitwiseOr(
+                    low != 0 ? ShiftRightLogical(bits, UInt(16)) : BitwiseAnd(bits, UInt(0xFFFF)),
+                    high != 0 ? BitwiseAnd(bits, UInt(0xFFFF_0000)) : ShiftLeftLogical(bits, UInt(16)));
+            }
+
+            var negate = (((control.NegLoMask >> index) & 1) << 15) | (((control.NegHiMask >> index) & 1) << 31);
+            if (negate != 0)
+            {
+                bits = BitwiseXor(bits, UInt(negate));
+            }
+
+            if (_module.TryGetConstantValue(bits, out var constant) &&
+                ((constant & 0x7FFF) > 0x7C00 || ((constant >> 16) & 0x7FFF) > 0x7C00))
+            {
+                return false;
+            }
+
+            HalfType();
+            pair = Bitcast(_half2Type, bits);
+            return true;
+        }
+
+        // EmitClampToUnitInterval on a native f16 value or pair: the ordered compares send NaN and every value up to zero to
+        // +0 and every value from one to one.
+        private uint ClampHalvesToUnitInterval(uint value, uint type, uint boolType, uint zero, uint one)
+        {
+            var lowerBounded = _module.AddInstruction(SpirvOp.Select, type,
+                _module.AddInstruction(SpirvOp.FOrdGreaterThan, boolType, value, zero), value, zero);
+            return _module.AddInstruction(SpirvOp.Select, type,
+                _module.AddInstruction(SpirvOp.FOrdLessThan, boolType, lowerBounded, one), lowerBounded, one);
+        }
+
+        private uint SelectU(uint condition, uint whenTrue, uint whenFalse) =>
+            _module.AddInstruction(SpirvOp.Select, _uintType, condition, whenTrue, whenFalse);
+
+        private uint UCmp(SpirvOp operation, uint left, uint right) =>
+            _module.AddInstruction(operation, _boolType, left, right);
+
+        private uint Equal(uint value, uint constant) =>
+            _module.AddInstruction(SpirvOp.IEqual, _boolType, value, UInt(constant));
+
+        private uint ISubU(uint left, uint right) =>
+            _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+
+        private bool TryEmitVectorCompare(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            uint condition = _module.ConstantBool(false);
+            var opcode = instruction.Opcode;
+            if (opcode is "VCmpClassF32" or "VCmpxClassF32")
+            {
+                var source = GetFloatSource(instruction, 0);
+                var raw = GetRawSource(instruction, 0);
+                var mask = GetRawSource(instruction, 1);
+                var negative = IsNotZero(BitwiseAnd(raw, UInt(0x8000_0000)));
+                var positive = _module.AddInstruction(
+                    SpirvOp.LogicalNot,
+                    _boolType,
+                    negative);
+                var nan = _module.AddInstruction(SpirvOp.IsNan, _boolType, source);
+                var infinity =
+                    _module.AddInstruction(SpirvOp.IsInf, _boolType, source);
+                var zero = _module.AddInstruction(
+                    SpirvOp.FOrdEqual,
+                    _boolType,
+                    source,
+                    Float(0));
+                var absolute = Ext(4, _floatType, source);
+                var nonzero = _module.AddInstruction(
+                    SpirvOp.FOrdGreaterThan,
+                    _boolType,
+                    absolute,
+                    Float(0));
+                var belowNormal = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    absolute,
+                    Bitcast(_floatType, UInt(0x0080_0000)));
+                var subnormal = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    nonzero,
+                    belowNormal);
+                var special = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    nan,
+                    _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        infinity,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalOr,
+                            _boolType,
+                            zero,
+                            subnormal)));
+                var normal = _module.AddInstruction(
+                    SpirvOp.LogicalNot,
+                    _boolType,
+                    special);
+
+                uint MaskedClass(uint bits, uint value)
+                {
+                    var enabled = IsNotZero(BitwiseAnd(mask, UInt(bits)));
+                    return _module.AddInstruction(
+                        SpirvOp.LogicalAnd,
+                        _boolType,
+                        enabled,
+                        value);
+                }
+
+                uint SignedClass(uint negativeBit, uint positiveBit, uint value)
+                {
+                    var negativeClass = MaskedClass(
+                        negativeBit,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalAnd,
+                            _boolType,
+                            negative,
+                            value));
+                    var positiveClass = MaskedClass(
+                        positiveBit,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalAnd,
+                            _boolType,
+                            positive,
+                            value));
+                    return _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        negativeClass,
+                        positiveClass);
+                }
+
+                condition = MaskedClass(0x003, nan);
+                condition = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    condition,
+                    SignedClass(0x004, 0x200, infinity));
+                condition = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    condition,
+                    SignedClass(0x008, 0x100, normal));
+                condition = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    condition,
+                    SignedClass(0x010, 0x080, subnormal));
+                condition = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    condition,
+                    SignedClass(0x020, 0x040, zero));
+            }
+            else if (opcode is
+                     "VCmpFF32" or "VCmpxFF32" or
+                     "VCmpFF16" or "VCmpxFF16" or
+                     "VCmpFI32" or "VCmpxFI32" or "VCmpFU32" or "VCmpxFU32" or
+                     "VCmpFI64" or "VCmpxFI64" or "VCmpFU64" or "VCmpxFU64")
+            {
+                condition = _module.ConstantBool(false);
+            }
+            else if (opcode is
+                     "VCmpTruF32" or "VCmpxTruF32" or
+                     "VCmpTruF16" or "VCmpxTruF16" or
+                     "VCmpTI32" or "VCmpxTI32" or "VCmpTU32" or "VCmpxTU32" or
+                     "VCmpTI64" or "VCmpxTI64" or "VCmpTU64" or "VCmpxTU64")
+            {
+                condition = _module.ConstantBool(true);
+            }
+            else if (opcode is
+                     "VCmpOF32" or "VCmpxOF32" or
+                     "VCmpUF32" or "VCmpxUF32" or
+                     "VCmpOF16" or "VCmpxOF16" or
+                     "VCmpUF16" or "VCmpxUF16")
+            {
+                var isHalf = opcode.EndsWith("F16", StringComparison.Ordinal);
+                var left = isHalf
+                    ? GetFloat16Source(instruction, 0)
+                    : GetFloatSource(instruction, 0);
+                var right = isHalf
+                    ? GetFloat16Source(instruction, 1)
+                    : GetFloatSource(instruction, 1);
+                var unordered = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, right));
+                condition = opcode is
+                    "VCmpUF32" or "VCmpxUF32" or
+                    "VCmpUF16" or "VCmpxUF16"
+                    ? unordered
+                    : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered);
+            }
+            else if (opcode.EndsWith("F64", StringComparison.Ordinal))
+            {
+                if (!TryGetDoubleSource(instruction, 0, out var left, out error) ||
+                    !TryGetDoubleSource(instruction, 1, out var right, out error))
+                {
+                    return false;
+                }
+
+                var predicate = opcode.Replace("VCmpx", "VCmp", StringComparison.Ordinal);
+                var unordered = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, right));
+                var operation = predicate switch
+                {
+                    "VCmpLtF64" => SpirvOp.FOrdLessThan,
+                    "VCmpEqF64" => SpirvOp.FOrdEqual,
+                    "VCmpLeF64" => SpirvOp.FOrdLessThanEqual,
+                    "VCmpGtF64" => SpirvOp.FOrdGreaterThan,
+                    "VCmpLgF64" => SpirvOp.FOrdNotEqual,
+                    "VCmpGeF64" => SpirvOp.FOrdGreaterThanEqual,
+                    "VCmpNeqF64" => SpirvOp.FUnordNotEqual,
+                    "VCmpNltF64" => SpirvOp.FUnordGreaterThanEqual,
+                    "VCmpNleF64" => SpirvOp.FUnordGreaterThan,
+                    "VCmpNgtF64" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNgeF64" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF64" => SpirvOp.FUnordEqual,
+                    _ => SpirvOp.Nop,
+                };
+                condition = predicate switch
+                {
+                    "VCmpFF64" => _module.ConstantBool(false),
+                    "VCmpTruF64" => _module.ConstantBool(true),
+                    "VCmpUF64" => unordered,
+                    "VCmpOF64" => _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered),
+                    _ when operation != SpirvOp.Nop => _module.AddInstruction(operation, _boolType, left, right),
+                    _ => 0u,
+                };
+                if (condition == 0)
+                {
+                    error = $"unsupported double compare {opcode}";
+                    return false;
+                }
+            }
+            else if (opcode.EndsWith("F16", StringComparison.Ordinal))
+            {
+                var left = GetFloat16Source(instruction, 0);
+                var right = GetFloat16Source(instruction, 1);
+                var operation = opcode switch
+                {
+                    "VCmpLtF16" or "VCmpxLtF16" => SpirvOp.FOrdLessThan,
+                    "VCmpEqF16" or "VCmpxEqF16" => SpirvOp.FOrdEqual,
+                    "VCmpLeF16" or "VCmpxLeF16" => SpirvOp.FOrdLessThanEqual,
+                    "VCmpGtF16" or "VCmpxGtF16" => SpirvOp.FOrdGreaterThan,
+                    "VCmpLgF16" or "VCmpxLgF16" => SpirvOp.FOrdNotEqual,
+                    "VCmpGeF16" or "VCmpxGeF16" => SpirvOp.FOrdGreaterThanEqual,
+                    "VCmpNeqF16" or "VCmpxNeqF16" => SpirvOp.FUnordNotEqual,
+                    "VCmpNltF16" or "VCmpxNltF16" => SpirvOp.FUnordGreaterThanEqual,
+                    "VCmpNleF16" or "VCmpxNleF16" => SpirvOp.FUnordGreaterThan,
+                    "VCmpNgtF16" or "VCmpxNgtF16" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNgeF16" or "VCmpxNgeF16" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF16" or "VCmpxNlgF16" => SpirvOp.FUnordEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported half compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
+                     opcode.EndsWith("F32", StringComparison.Ordinal))
+            {
+                var left = GetFloatSource(instruction, 0);
+                var right = GetFloatSource(instruction, 1);
+                var operation = opcode switch
+                {
+                    "VCmpLtF32" or "VCmpxLtF32" => SpirvOp.FOrdLessThan,
+                    "VCmpEqF32" or "VCmpxEqF32" => SpirvOp.FOrdEqual,
+                    "VCmpLeF32" or "VCmpxLeF32" => SpirvOp.FOrdLessThanEqual,
+                    "VCmpGtF32" or "VCmpxGtF32" => SpirvOp.FOrdGreaterThan,
+                    "VCmpLgF32" or "VCmpxLgF32" => SpirvOp.FOrdNotEqual,
+                    "VCmpGeF32" or "VCmpxGeF32" => SpirvOp.FOrdGreaterThanEqual,
+                    "VCmpNeqF32" or "VCmpxNeqF32" => SpirvOp.FUnordNotEqual,
+                    "VCmpNltF32" or "VCmpxNltF32" => SpirvOp.FUnordGreaterThanEqual,
+                    "VCmpNleF32" or "VCmpxNleF32" => SpirvOp.FUnordGreaterThan,
+                    "VCmpNgtF32" or "VCmpxNgtF32" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNgeF32" or "VCmpxNgeF32" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF32" or "VCmpxNlgF32" => SpirvOp.FUnordEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported float compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode.EndsWith("U64", StringComparison.Ordinal))
+            {
+                if (opcode is "VCmpFU64" or "VCmpxFU64")
+                {
+                    condition = _module.ConstantBool(false);
+                }
+                else if (opcode is "VCmpTU64" or "VCmpxTU64")
+                {
+                    condition = _module.ConstantBool(true);
+                }
+                else
+                {
+                    var wideLeft = GetRawSource64(instruction, 0);
+                    var wideRight = GetRawSource64(instruction, 1);
+                    var operation = opcode switch
+                    {
+                        "VCmpEqU64" or "VCmpxEqU64" => SpirvOp.IEqual,
+                        "VCmpNeU64" or "VCmpxNeU64" => SpirvOp.INotEqual,
+                        "VCmpLtU64" or "VCmpxLtU64" => SpirvOp.ULessThan,
+                        "VCmpLeU64" or "VCmpxLeU64" => SpirvOp.ULessThanEqual,
+                        "VCmpGtU64" or "VCmpxGtU64" => SpirvOp.UGreaterThan,
+                        "VCmpGeU64" or "VCmpxGeU64" => SpirvOp.UGreaterThanEqual,
+                        _ => SpirvOp.Nop,
+                    };
+                    if (operation == SpirvOp.Nop)
+                    {
+                        error = $"unsupported u64 compare {opcode}";
+                        return false;
+                    }
+
+                    condition = _module.AddInstruction(operation, _boolType, wideLeft, wideRight);
+                }
+            }
+            else if (opcode.EndsWith("U16", StringComparison.Ordinal) || opcode.EndsWith("I16", StringComparison.Ordinal))
+            {
+                // VOPC 16-bit integer comparisons consume the low half of each VGPR.
+                // Signed comparisons sign-extend that half before the SPIR-V operation.
+                var signed = opcode.EndsWith("I16", StringComparison.Ordinal);
+                var left = GetInteger16Source(instruction, 0, signed);
+                var right = GetInteger16Source(instruction, 1, signed);
+                var operation = opcode switch
+                {
+                    "VCmpEqI16" or "VCmpxEqI16" or
+                    "VCmpEqU16" or "VCmpxEqU16" => SpirvOp.IEqual,
+                    "VCmpNeI16" or "VCmpxNeI16" or
+                    "VCmpNeU16" or "VCmpxNeU16" => SpirvOp.INotEqual,
+                    "VCmpLtI16" or "VCmpxLtI16" => SpirvOp.SLessThan,
+                    "VCmpLeI16" or "VCmpxLeI16" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI16" or "VCmpxGtI16" => SpirvOp.SGreaterThan,
+                    "VCmpGeI16" or "VCmpxGeI16" => SpirvOp.SGreaterThanEqual,
+                    "VCmpLtU16" or "VCmpxLtU16" => SpirvOp.ULessThan,
+                    "VCmpLeU16" or "VCmpxLeU16" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU16" or "VCmpxGtU16" => SpirvOp.UGreaterThan,
+                    "VCmpGeU16" or "VCmpxGeU16" => SpirvOp.UGreaterThanEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported 16-bit integer compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
+            {
+                var compare64 = opcode.EndsWith("U64", StringComparison.Ordinal) ||
+                    opcode.EndsWith("I64", StringComparison.Ordinal);
+                var left = compare64
+                    ? GetRawSource64(instruction, 0)
+                    : GetRawSource(instruction, 0);
+                var right = compare64
+                    ? GetRawSource64(instruction, 1)
+                    : GetRawSource(instruction, 1);
+                var signed16 = opcode.EndsWith("I16", StringComparison.Ordinal);
+                var signed = signed16 ||
+                    opcode.EndsWith("I32", StringComparison.Ordinal) ||
+                    opcode.EndsWith("I64", StringComparison.Ordinal);
+                if (signed16)
+                {
+                    left = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, left),
+                        UInt(0),
+                        UInt(16));
+                    right = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, right),
+                        UInt(0),
+                        UInt(16));
+                }
+                if (signed)
+                {
+                    if (!signed16)
+                    {
+                        var signedType = compare64 ? _longType : _intType;
+                        left = Bitcast(signedType, left);
+                        right = Bitcast(signedType, right);
+                    }
+                }
+                else if (opcode.EndsWith("I64", StringComparison.Ordinal))
+                {
+                    left = Bitcast(_longType, left);
+                    right = Bitcast(_longType, right);
+                }
+
+                var operation = opcode switch
+                {
+                    "VCmpEqI32" or "VCmpxEqI32" or
+                    "VCmpEqU32" or "VCmpxEqU32" => SpirvOp.IEqual,
+                    "VCmpNeI32" or "VCmpxNeI32" or
+                    "VCmpNeU32" or "VCmpxNeU32" => SpirvOp.INotEqual,
+                    "VCmpEqI16" or "VCmpxEqI16" => SpirvOp.IEqual,
+                    "VCmpNeI16" or "VCmpxNeI16" => SpirvOp.INotEqual,
+                    "VCmpNeU64" or "VCmpxNeU64" or
+                    "VCmpNeI64" or "VCmpxNeI64" => SpirvOp.INotEqual,
+                    "VCmpLtI16" or "VCmpxLtI16" => SpirvOp.SLessThan,
+                    "VCmpLeI16" or "VCmpxLeI16" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI16" or "VCmpxGtI16" => SpirvOp.SGreaterThan,
+                    "VCmpGeI16" or "VCmpxGeI16" => SpirvOp.SGreaterThanEqual,
+                    "VCmpEqU64" or "VCmpxEqU64" or
+                    "VCmpEqI64" or "VCmpxEqI64" => SpirvOp.IEqual,
+                    "VCmpLtU64" or "VCmpxLtU64" => SpirvOp.ULessThan,
+                    "VCmpLeU64" or "VCmpxLeU64" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU64" or "VCmpxGtU64" => SpirvOp.UGreaterThan,
+                    "VCmpGeU64" or "VCmpxGeU64" => SpirvOp.UGreaterThanEqual,
+                    "VCmpLtI64" or "VCmpxLtI64" => SpirvOp.SLessThan,
+                    "VCmpLeI64" or "VCmpxLeI64" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI64" or "VCmpxGtI64" => SpirvOp.SGreaterThan,
+                    "VCmpGeI64" or "VCmpxGeI64" => SpirvOp.SGreaterThanEqual,
+                    "VCmpLtI32" or "VCmpxLtI32" => SpirvOp.SLessThan,
+                    "VCmpLeI32" or "VCmpxLeI32" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI32" or "VCmpxGtI32" => SpirvOp.SGreaterThan,
+                    "VCmpGeI32" or "VCmpxGeI32" => SpirvOp.SGreaterThanEqual,
+                    "VCmpLtU32" or "VCmpxLtU32" => SpirvOp.ULessThan,
+                    "VCmpLeU32" or "VCmpxLeU32" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU32" or "VCmpxGtU32" => SpirvOp.UGreaterThan,
+                    "VCmpGeU32" or "VCmpxGeU32" => SpirvOp.UGreaterThanEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported integer compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+
+            if (_request.Program.Address == 0x0000000500781200ul &&
+                ((instruction.Pc == 0x4D4 &&
+                  Environment.GetEnvironmentVariable(
+                      "SHARPEMU_FORCE_TITLE_COMPARE_4D4") == "1") ||
+                 (instruction.Pc == 0x540 &&
+                  Environment.GetEnvironmentVariable(
+                      "SHARPEMU_FORCE_TITLE_COMPARE_540") == "1")))
+            {
+                condition = _module.ConstantBool(true);
+            }
+
+            // Vector compares fully overwrite the destination mask, but only
+            // lanes enabled by EXEC can pass the test: VCC = EXEC & condition.
+            // Balloting the raw condition leaks results from disabled lanes
+            // into later saveexec/branch sequences.
+            var activeCondition = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                condition);
+            if (instruction.Control is Gen5DppControl compareDpp)
+            {
+                activeCondition = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _boolType,
+                    IsDppWriteEnabled(compareDpp),
+                    activeCondition,
+                    Load(_boolType, _vcc));
+            }
+
+            if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
+            {
+                // GFX10 VCMPX is EXEC-only. The SDWA bits that older
+                // generations exposed as an explicit scalar destination must
+                // not overwrite VCC/an SGPR pair here. Guest shaders rely on
+                // those registers retaining a saved EXEC mask for later
+                // reconvergence.
+                StoreWaveMask(126, activeCondition);
+            }
+            else
+            {
+                var compareDestination = instruction.Control switch
+                {
+                    Gen5SdwaControl { ScalarDestination: { } scalarDestination } => scalarDestination,
+                    Gen5Vop3Control { ScalarDestination: { } scalarDestination } => scalarDestination,
+                    _ => 106u,
+                };
+                if (_localComparisonPredicates.Contains(instruction.Pc))
+                    Store(_vcc, activeCondition);
+                else
+                    StoreWaveMask(compareDestination, activeCondition);
+            }
+
+            return true;
+        }
+
+        private bool TryEmitScalarAlu(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
+            {
+                return TryEmitScalarCompare(instruction, out error);
+            }
+
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = "missing scalar destination";
+                return false;
+            }
+
+            var destination = instruction.Destinations[0].Value;
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopk)
+            {
+                var immediate = unchecked((uint)(short)(instruction.Words[0] & 0xFFFF));
+                if (instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+                {
+                    // The unsigned compares take SIMM16 zero-extended; only the signed ones sign-extend it.
+                    if (instruction.Opcode.EndsWith("U32", StringComparison.Ordinal))
+                    {
+                        immediate = instruction.Words[0] & 0xFFFF;
+                    }
+                    return TryEmitScalarCompareK(instruction, destination, immediate, out error);
+                }
+
+                var current = LoadS(destination);
+                var value = instruction.Opcode switch
+                {
+                    "SMovkI32" => UInt(immediate),
+                    "SAddkI32" => IAdd(current, UInt(immediate)),
+                    "SMulkI32" => _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        current,
+                        UInt(immediate)),
+                    _ => 0u,
+                };
+                if (value == 0)
+                {
+                    error = $"unsupported scalar immediate {instruction.Opcode}";
+                    return false;
+                }
+
+                // RDNA2 ISA: S_ADDK_I32 writes SCC = signed overflow, exactly like
+                // S_ADD_I32. S_MOVK_I32 and S_MULK_I32 leave SCC alone.
+                if (instruction.Opcode == "SAddkI32")
+                {
+                    Store(_scc, SignedAddOverflow(current, UInt(immediate), value));
+                }
+
+                StoreS(destination, value);
+                return true;
+            }
+
+            if (instruction.Opcode == "SGetpcB64")
+            {
+                {
+                    // The draw's shader base comes from push data, so one module serves every address; a linked function
+                    // reads its own address from the call targets.
+                    var size = (ulong)(instruction.Words.Count * sizeof(uint));
+                    uint next;
+                    if (instruction.Control is ShaderFunctionPcControl function && _callTargetSlots is not null)
+                    {
+                        next = IAdd64(CallTarget(function.FunctionAddress), ULong(unchecked(function.FunctionOffset + size)));
+                    }
+                    else
+                    {
+                        var (baseLow, baseHigh) = LoadShaderBase();
+                        next = IAdd64(Pair64(baseLow, baseHigh), ULong(unchecked(instruction.ProgramOffset + size)));
+                    }
+                    StoreS(destination, Narrow(next));
+                    StoreS(destination + 1, Narrow(ShiftRightLogical64(next, ULong(32))));
+                    return true;
+                }
+            }
+
+            if (instruction.Opcode is "SQuadmaskB32" or "SQuadmaskB64")
+            {
+                var wide = instruction.Opcode == "SQuadmaskB64";
+                var source = wide ? GetRawSource64(instruction, 0) : 0u;
+                var low = wide ? Narrow(source) : GetRawSource(instruction, 0);
+                var high = wide ? Narrow(ShiftRightLogical64(source, ULong(32))) : UInt(0);
+                var quadResult = UInt(0);
+                for (uint quad = 0; quad < (wide ? 16u : 8u); quad++)
+                {
+                    var nibble = BitwiseAnd(ShiftRightLogical(quad < 8 ? low : high, UInt((quad % 8) * 4)), UInt(15));
+                    var bit = _module.AddInstruction(SpirvOp.Select, _uintType, IsNotZero(nibble), UInt(1u << (int)quad), UInt(0));
+                    quadResult = BitwiseOr(quadResult, bit);
+                }
+                StoreS(destination, quadResult);
+                if (wide) StoreS(destination + 1, UInt(0));
+                Store(_scc, IsNotZero(quadResult));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBcnt1I32B64")
+            {
+                // Vulkan only allows OpBitCount on 32-bit operands without
+                // maintenance9, so count each half separately.
+                var wide = GetRawSource64(instruction, 0);
+                var bitCountResult = IAdd(
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, Narrow(wide)),
+                    _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        Narrow(ShiftRightLogical64(wide, _module.Constant64(_ulongType, 32)))));
+                StoreS(destination, bitCountResult);
+                Store(_scc, IsNotZero(bitCountResult));
+                return true;
+            }
+
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                var wide = GetRawSource64(instruction, 0);
+                var low = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    wide);
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(
+                        wide,
+                        _module.Constant64(_ulongType, 32)));
+                var lowIndex = Ext(73, _uintType, low);
+                var highIndex = IAdd(Ext(73, _uintType, high), UInt(32));
+                var bitIndex = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    IsNotZero(low),
+                    lowIndex,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        IsNotZero(high),
+                        highIndex,
+                        UInt(uint.MaxValue)));
+                StoreS(destination, bitIndex);
+                return true;
+            }
+
+            if (instruction.Opcode == "SFlbitI32B64")
+            {
+                var source = GetRawSource64(instruction, 0);
+                var low = _module.AddInstruction(SpirvOp.UConvert, _uintType, source);
+                var high = _module.AddInstruction(SpirvOp.UConvert, _uintType,
+                    ShiftRightLogical64(source, ULong(32)));
+                var highIndex = _module.AddInstruction(SpirvOp.ISub, _uintType,
+                    UInt(31), Ext(75, _uintType, high));
+                var lowIndex = _module.AddInstruction(SpirvOp.ISub, _uintType,
+                    UInt(63), Ext(75, _uintType, low));
+                var bitIndex = _module.AddInstruction(SpirvOp.Select, _uintType,
+                    IsNotZero(high), highIndex,
+                    _module.AddInstruction(SpirvOp.Select, _uintType,
+                        IsNotZero(low), lowIndex, UInt(uint.MaxValue)));
+                StoreS(destination, bitIndex);
+                return true;
+            }
+
+            if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
+                instruction.Opcode == "SAshrI64" ||
+                instruction.Opcode is "SWqmB64" or "SBfeU64" or "SBfeI64")
+            {
+                return TryEmitScalar64(instruction, destination, out error);
+            }
+
+            var left = GetRawSource(instruction, 0);
+            if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))
+            {
+                var oldExec64 = ExecutionWaveMask();
+                var oldExec = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    oldExec64);
+                var notLeft = _module.AddInstruction(SpirvOp.Not, _uintType, left);
+                var notOldExec = _module.AddInstruction(SpirvOp.Not, _uintType, oldExec);
+                var newExec = instruction.Opcode switch
+                {
+                    "SAndSaveexecB32" => BitwiseAnd(oldExec, left),
+                    "SOrSaveexecB32" => BitwiseOr(oldExec, left),
+                    "SXorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.BitwiseXor, _uintType, oldExec, left),
+                    "SAndn1SaveexecB32" => BitwiseAnd(notLeft, oldExec),
+                    "SAndn2SaveexecB32" => BitwiseAnd(left, notOldExec),
+                    "SOrn1SaveexecB32" => BitwiseOr(notLeft, oldExec),
+                    "SOrn2SaveexecB32" => BitwiseOr(left, notOldExec),
+                    "SNandSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not, _uintType, BitwiseAnd(left, oldExec)),
+                    "SNorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not, _uintType, BitwiseOr(left, oldExec)),
+                    "SXnorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _uintType,
+                            left,
+                            oldExec)),
+                    _ => 0u,
+                };
+                if (newExec == 0)
+                {
+                    error = $"unsupported scalar 32-bit saveexec opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                StoreS(destination, oldExec);
+                // B32 saveexec is the Wave32 form; EXEC_HI is zero.
+                var newExec64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    newExec);
+                StoreS64(126, newExec64);
+                Store(_scc, IsNotZero(newExec));
+                return true;
+            }
+
+            uint result;
+            switch (instruction.Opcode)
+            {
+                case "SMovB32":
+                    result = left;
+                    break;
+                case "SNotB32":
+                    result = _module.AddInstruction(SpirvOp.Not, _uintType, left);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                case "SAbsI32":
+                {
+                    var sign = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(0), ShiftRightLogical(left, UInt(31)));
+                    var magnitude = _module.AddInstruction(SpirvOp.BitwiseXor, _uintType, left, sign);
+                    result = _module.AddInstruction(SpirvOp.ISub, _uintType, magnitude, sign);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                }
+                case "SWqmB32":
+                {
+                    var quadAny = BitwiseAnd(
+                        BitwiseOr(
+                            left,
+                            BitwiseOr(
+                                ShiftRightLogical(left, UInt(1)),
+                                BitwiseOr(
+                                    ShiftRightLogical(left, UInt(2)),
+                                    ShiftRightLogical(left, UInt(3))))),
+                        UInt(0x1111_1111));
+                    result = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        quadAny,
+                        UInt(0xF));
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                }
+                case "SBrevB32":
+                    result = _module.AddInstruction(SpirvOp.BitReverse, _uintType, left);
+                    StoreS(destination, result);
+                    return true;
+                case "SBitreplicateB64B32":
+                {
+                    for (uint half = 0; half < 2; half++)
+                    {
+                        var expanded = UInt(0);
+                        for (uint bit = 0; bit < 16; bit++)
+                        {
+                            var selected = BitwiseAnd(ShiftRightLogical(left, UInt(half * 16 + bit)), UInt(1));
+                            var pair = BitwiseOr(selected, ShiftLeftLogical(selected, UInt(1)));
+                            expanded = BitwiseOr(expanded, ShiftLeftLogical(pair, UInt(bit * 2)));
+                        }
+                        StoreS(destination + half, expanded);
+                    }
+                    return true;
+                }
+                case "SBcnt1I32B32":
+                    result = _module.AddInstruction(SpirvOp.BitCount, _uintType, left);
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                case "SFF1I32B32":
+                    result = Ext(73, _uintType, left);
+                    StoreS(destination, result);
+                    return true;
+                case "SFlbitI32B32":
+                    result = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(31), Ext(75, _uintType, left));
+                    StoreS(destination, _module.AddInstruction(SpirvOp.Select, _uintType,
+                        IsNotZero(left), result, UInt(uint.MaxValue)));
+                    return true;
+                case "SBitset0B32":
+                case "SBitset1B32":
+                    // S_BITSET*_B32 is a read-modify-write of the destination:
+                    // it sets the single bit selected by SSRC0[4:0]. Neither
+                    // form writes SCC.
+                    result = _module.AddInstruction(
+                        SpirvOp.BitFieldInsert,
+                        _uintType,
+                        LoadS(destination),
+                        UInt(instruction.Opcode == "SBitset0B32" ? 0u : 1u),
+                        BitwiseAnd(left, UInt(31)),
+                        UInt(1));
+                    StoreS(destination, result);
+                    return true;
+                default:
+                {
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = $"missing scalar source for {instruction.Opcode}";
+                        return false;
+                    }
+
+                    var right = GetRawSource(instruction, 1);
+                    switch (instruction.Opcode)
+                    {
+                        case "SAddU32":
+                            result = IAdd(left, right);
+                            Store(_scc, _module.AddInstruction(
+                                SpirvOp.ULessThan,
+                                _boolType,
+                                result,
+                                left));
+                            break;
+                        case "SSubU32":
+                            result = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                left,
+                                right);
+                            Store(_scc, _module.AddInstruction(
+                                SpirvOp.UGreaterThan,
+                                _boolType,
+                                right,
+                                left));
+                            break;
+                        case "SAddI32":
+                            result = IAdd(left, right);
+                            Store(_scc, SignedAddOverflow(left, right, result));
+                            break;
+                        case "SSubI32":
+                            result = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                left,
+                                right);
+                            Store(_scc, SignedSubOverflow(left, right, result));
+                            break;
+                        case "SAddF32":
+                            result = Bitcast(
+                                _uintType,
+                                _module.AddInstruction(
+                                    SpirvOp.FAdd,
+                                    _floatType,
+                                    Bitcast(_floatType, left),
+                                    Bitcast(_floatType, right)));
+                            break;
+                        case "SSubF32":
+                            result = Bitcast(
+                                _uintType,
+                                _module.AddInstruction(
+                                    SpirvOp.FSub,
+                                    _floatType,
+                                    Bitcast(_floatType, left),
+                                    Bitcast(_floatType, right)));
+                            break;
+                        case "SAddcU32":
+                        {
+                            var carryIn = _module.AddInstruction(
+                                SpirvOp.Select,
+                                _uintType,
+                                Load(_boolType, _scc),
+                                UInt(1),
+                                UInt(0));
+                            var partial = IAdd(left, right);
+                            result = IAdd(partial, carryIn);
+                            var firstCarry = _module.AddInstruction(
+                                SpirvOp.ULessThan,
+                                _boolType,
+                                partial,
+                                left);
+                            var secondCarry = _module.AddInstruction(
+                                SpirvOp.ULessThan,
+                                _boolType,
+                                result,
+                                partial);
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.LogicalOr,
+                                    _boolType,
+                                    firstCarry,
+                                    secondCarry));
+                            break;
+                        }
+                        case "SSubbU32":
+                        {
+                            var borrow = _module.AddInstruction(
+                                SpirvOp.Select,
+                                _uintType,
+                                Load(_boolType, _scc),
+                                UInt(1),
+                                UInt(0));
+                            var partial = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                left,
+                                right);
+                            result = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                partial,
+                                borrow);
+                            var firstBorrow = _module.AddInstruction(
+                                SpirvOp.UGreaterThan,
+                                _boolType,
+                                right,
+                                left);
+                            var secondBorrow = _module.AddInstruction(
+                                SpirvOp.LogicalAnd,
+                                _boolType,
+                                _module.AddInstruction(
+                                    SpirvOp.IEqual,
+                                    _boolType,
+                                    borrow,
+                                    UInt(1)),
+                                _module.AddInstruction(
+                                    SpirvOp.IEqual,
+                                    _boolType,
+                                    right,
+                                    left));
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.LogicalOr,
+                                    _boolType,
+                                    firstBorrow,
+                                    secondBorrow));
+                            break;
+                        }
+                        case "SMulI32":
+                            result = _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _uintType,
+                                left,
+                                right);
+                            break;
+                        case "SMulHiI32":
+                            result = Bitcast(
+                                _uintType,
+                                MultiplyExtended(Bitcast(_intType, left), Bitcast(_intType, right), signed: true).High);
+                            break;
+                        case "SMulHiU32":
+                            result = MultiplyExtended(left, right, signed: false).High;
+                            break;
+                        case "SAndB32":
+                            result = BitwiseAnd(left, right);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SOrB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.BitwiseOr,
+                                _uintType,
+                                left,
+                                right);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SXorB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.BitwiseXor,
+                                _uintType,
+                                left,
+                                right);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SAndn2B32":
+                            result = BitwiseAnd(
+                                left,
+                                _module.AddInstruction(SpirvOp.Not, _uintType, right));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SOrn2B32":
+                            result = _module.AddInstruction(
+                                SpirvOp.BitwiseOr,
+                                _uintType,
+                                left,
+                                _module.AddInstruction(SpirvOp.Not, _uintType, right));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SNandB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.Not,
+                                _uintType,
+                                BitwiseAnd(left, right));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SNorB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.Not,
+                                _uintType,
+                                _module.AddInstruction(
+                                    SpirvOp.BitwiseOr,
+                                    _uintType,
+                                    left,
+                                    right));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SXnorB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.Not,
+                                _uintType,
+                                _module.AddInstruction(
+                                    SpirvOp.BitwiseXor,
+                                    _uintType,
+                                    left,
+                                    right));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SLshlB32":
+                            result = ShiftLeftLogical(left, right);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SLshrB32":
+                            result = ShiftRightLogical(
+                                left,
+                                BitwiseAnd(right, UInt(31)));
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SAshrI32":
+                            result = ShiftRightArithmetic(left, right);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        case "SBfmB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.BitFieldInsert,
+                                _uintType,
+                                UInt(0),
+                                UInt(uint.MaxValue),
+                                BitwiseAnd(right, UInt(31)),
+                                BitwiseAnd(left, UInt(31)));
+                            break;
+                        case "SBfeU32":
+                        case "SBfeI32":
+                        {
+                            var offset = BitwiseAnd(right, UInt(31));
+                            var requestedWidth = BitwiseAnd(
+                                ShiftRightLogical(right, UInt(16)),
+                                UInt(0x7F));
+                            var remaining = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                UInt(32),
+                                offset);
+                            var width = Ext(
+                                38,
+                                _uintType,
+                                requestedWidth,
+                                remaining);
+                            result = instruction.Opcode == "SBfeI32"
+                                ? Bitcast(
+                                    _uintType,
+                                    _module.AddInstruction(
+                                        SpirvOp.BitFieldSExtract,
+                                        _intType,
+                                        Bitcast(_intType, left),
+                                        offset,
+                                        width))
+                                : _module.AddInstruction(
+                                    SpirvOp.BitFieldUExtract,
+                                    _uintType,
+                                    left,
+                                    offset,
+                                    width);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        }
+                        case "SCselectB32":
+                            result = _module.AddInstruction(
+                                SpirvOp.Select,
+                                _uintType,
+                                Load(_boolType, _scc),
+                                left,
+                                right);
+                            break;
+                        case "SMinU32":
+                            result = Ext(38, _uintType, left, right);
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.ULessThan,
+                                    _boolType,
+                                    left,
+                                    right));
+                            break;
+                        case "SMinI32":
+                            result = Bitcast(
+                                _uintType,
+                                Ext(39, _intType, Bitcast(_intType, left), Bitcast(_intType, right)));
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.SLessThan,
+                                    _boolType,
+                                    Bitcast(_intType, left),
+                                    Bitcast(_intType, right)));
+                            break;
+                        case "SMaxU32":
+                            result = Ext(41, _uintType, left, right);
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.UGreaterThan,
+                                    _boolType,
+                                    left,
+                                    right));
+                            break;
+                        case "SMaxI32":
+                            result = Bitcast(
+                                _uintType,
+                                Ext(42, _intType, Bitcast(_intType, left), Bitcast(_intType, right)));
+                            Store(
+                                _scc,
+                                _module.AddInstruction(
+                                    SpirvOp.SGreaterThan,
+                                    _boolType,
+                                    Bitcast(_intType, left),
+                                    Bitcast(_intType, right)));
+                            break;
+                        case "SAbsdiffI32":
+                        {
+                            // The difference wraps, so the magnitude of the most
+                            // negative value stays negative like on the hardware.
+                            var difference = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+                            var sign = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                UInt(0),
+                                ShiftRightLogical(difference, UInt(31)));
+                            result = _module.AddInstruction(
+                                SpirvOp.ISub,
+                                _uintType,
+                                _module.AddInstruction(SpirvOp.BitwiseXor, _uintType, difference, sign),
+                                sign);
+                            Store(_scc, IsNotZero(result));
+                            break;
+                        }
+                        case "SLshl1AddU32":
+                        case "SLshl2AddU32":
+                        case "SLshl3AddU32":
+                        case "SLshl4AddU32":
+                        {
+                            var shift = (uint)(instruction.Opcode[5] - '0');
+                            result = IAdd(
+                                ShiftLeftLogical(left, UInt(shift)),
+                                right);
+                            break;
+                        }
+                        case "SPackLlB32B16":
+                            result = BitwiseOr(
+                                BitwiseAnd(left, UInt(0xFFFF)),
+                                ShiftLeftLogical(right, UInt(16)));
+                            break;
+                        case "SPackLhB32B16":
+                            result = BitwiseOr(
+                                BitwiseAnd(left, UInt(0xFFFF)),
+                                BitwiseAnd(right, UInt(0xFFFF0000)));
+                            break;
+                        case "SPackHhB32B16":
+                            result = BitwiseOr(
+                                ShiftRightLogical(left, UInt(16)),
+                                BitwiseAnd(right, UInt(0xFFFF0000)));
+                            break;
+                        default:
+                            error = $"unsupported scalar opcode {instruction.Opcode}";
+                            return false;
+                    }
+
+                    break;
+                }
+            }
+
+            StoreS(destination, result);
+            return true;
+        }
+
+        private bool TryEmitScalarCompare(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count < 2)
+            {
+                error = "missing scalar compare source";
+                return false;
+            }
+
+            if (instruction.Opcode is "SCmpEqU64" or "SCmpLgU64")
+            {
+                var wideLeft = GetRawSource64(instruction, 0);
+                var wideRight = GetRawSource64(instruction, 1);
+                Store(
+                    _scc,
+                    _module.AddInstruction(
+                        instruction.Opcode == "SCmpEqU64"
+                            ? SpirvOp.IEqual
+                            : SpirvOp.INotEqual,
+                        _boolType,
+                        wideLeft,
+                        wideRight));
+                return true;
+            }
+
+            if (instruction.Opcode is "SBitcmp0B64" or "SBitcmp1B64")
+            {
+                // The 64-bit value is the first source; only the low six bits
+                // of the second one pick the bit.
+                var selected = ShiftLeftLogical64(
+                    _module.Constant64(_ulongType, 1),
+                    Widen(BitwiseAnd(GetRawSource(instruction, 1), UInt(63))));
+                var isSet = IsNotZero64(
+                    _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        GetRawSource64(instruction, 0),
+                        selected));
+                Store(
+                    _scc,
+                    instruction.Opcode == "SBitcmp1B64"
+                        ? isSet
+                        : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, isSet));
+                return true;
+            }
+
+            var left = GetRawSource(instruction, 0);
+            var right = GetRawSource(instruction, 1);
+            if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32")
+            {
+                var shifted = ShiftRightLogical(
+                    left,
+                    BitwiseAnd(right, UInt(31)));
+                var isSet = IsNotZero(BitwiseAnd(shifted, UInt(1)));
+                Store(
+                    _scc,
+                    instruction.Opcode == "SBitcmp1B32"
+                        ? isSet
+                        : _module.AddInstruction(
+                            SpirvOp.LogicalNot,
+                            _boolType,
+                            isSet));
+                return true;
+            }
+
+            var operation = instruction.Opcode switch
+            {
+                "SCmpEqI32" or "SCmpEqU32" => SpirvOp.IEqual,
+                "SCmpLgI32" or "SCmpLgU32" => SpirvOp.INotEqual,
+                "SCmpGtI32" => SpirvOp.SGreaterThan,
+                "SCmpGeI32" => SpirvOp.SGreaterThanEqual,
+                "SCmpLtI32" => SpirvOp.SLessThan,
+                "SCmpLeI32" => SpirvOp.SLessThanEqual,
+                "SCmpGtU32" => SpirvOp.UGreaterThan,
+                "SCmpGeU32" => SpirvOp.UGreaterThanEqual,
+                "SCmpLtU32" => SpirvOp.ULessThan,
+                "SCmpLeU32" => SpirvOp.ULessThanEqual,
+                _ => SpirvOp.Nop,
+            };
+            if (operation == SpirvOp.Nop)
+            {
+                error = $"unsupported scalar compare {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Opcode.EndsWith("I32", StringComparison.Ordinal))
+            {
+                left = Bitcast(_intType, left);
+                right = Bitcast(_intType, right);
+            }
+
+            Store(_scc, _module.AddInstruction(operation, _boolType, left, right));
+            return true;
+        }
+
+        private bool TryEmitScalarCompareK(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint immediate,
+            out string error)
+        {
+            error = string.Empty;
+            var left = LoadS(destination);
+            var right = UInt(immediate);
+            var operation = instruction.Opcode switch
+            {
+                "SCmpkEqI32" or "SCmpkEqU32" => SpirvOp.IEqual,
+                "SCmpkLgI32" or "SCmpkLgU32" => SpirvOp.INotEqual,
+                "SCmpkGtI32" => SpirvOp.SGreaterThan,
+                "SCmpkGeI32" => SpirvOp.SGreaterThanEqual,
+                "SCmpkLtI32" => SpirvOp.SLessThan,
+                "SCmpkLeI32" => SpirvOp.SLessThanEqual,
+                "SCmpkGtU32" => SpirvOp.UGreaterThan,
+                "SCmpkGeU32" => SpirvOp.UGreaterThanEqual,
+                "SCmpkLtU32" => SpirvOp.ULessThan,
+                "SCmpkLeU32" => SpirvOp.ULessThanEqual,
+                _ => SpirvOp.Nop,
+            };
+            if (operation == SpirvOp.Nop)
+            {
+                error = $"unsupported scalar immediate compare {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Opcode.EndsWith("I32", StringComparison.Ordinal))
+            {
+                left = Bitcast(_intType, left);
+                right = Bitcast(_intType, right);
+            }
+
+            Store(_scc, _module.AddInstruction(operation, _boolType, left, right));
+            return true;
+        }
+
+        private bool TryEmitScalar64(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            out string error)
+        {
+            error = string.Empty;
+
+            // S_SETPC_B64 and S_SWAPPC_B64 are dynamic call/return operations.  The Gen5
+            // translator has already linearized the reachable shader body,
+            // so there is no host program counter to exchange here.  Keep
+            // the instruction as a control-flow marker and continue with the
+            // linearized body; unlike the binary scalar operations it has a
+            // single pair operand (s[dst:dst+1] <- s[src:src+1]).
+            if (instruction.Opcode is "SSetpcB64" or "SSwappcB64")
+            {
+                return true;
+            }
+
+            // S_BITSET0/1_B64 use a 32-bit bit index and update the 64-bit
+            // value already held at the destination; they do not have a
+            // scalar 64-bit source operand.
+            if (instruction.Opcode is "SBitset0B64" or "SBitset1B64")
+            {
+                var bitIndex = Widen(BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var selected = ShiftLeftLogical64(
+                    _module.Constant64(_ulongType, 1),
+                    bitIndex);
+                var current = LoadS64(destination);
+                var updated = instruction.Opcode == "SBitset1B64"
+                    ? _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        current,
+                        selected)
+                    : _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        current,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, selected));
+                StoreS64(destination, updated);
+                return true;
+            }
+
+            var left = GetRawSource64(instruction, 0);
+            if (instruction.Opcode.EndsWith("SaveexecB64", StringComparison.Ordinal))
+            {
+                var oldExec = ExecutionWaveMask();
+                var notLeft = _module.AddInstruction(SpirvOp.Not, _ulongType, left);
+                var newExec = instruction.Opcode switch
+                {
+                    "SAndSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd, _ulongType, oldExec, left),
+                    "SOrSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr, _ulongType, oldExec, left),
+                    "SXorSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseXor, _ulongType, oldExec, left),
+                    "SAndn2SaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        left,
+                        _module.AddInstruction(
+                            SpirvOp.Not,
+                            _ulongType,
+                            oldExec)),
+                    "SAndn1SaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        notLeft,
+                        oldExec),
+                    "SOrn1SaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        notLeft,
+                        oldExec),
+                    "SOrn2SaveexecB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        left,
+                        _module.AddInstruction(
+                            SpirvOp.Not,
+                            _ulongType,
+                            oldExec)),
+                    "SNandSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseAnd,
+                            _ulongType,
+                            left,
+                            oldExec)),
+                    "SNorSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseOr,
+                            _ulongType,
+                            left,
+                            oldExec)),
+                    "SXnorSaveexecB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _ulongType,
+                            left,
+                            oldExec)),
+                    _ => 0u,
+                };
+                if (newExec == 0)
+                {
+                    error =
+                        $"unsupported scalar 64-bit opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                newExec = NormalizeExecMask(newExec);
+
+                StoreS64(destination, oldExec);
+                StoreS64(126, newExec);
+                Store(_scc, IsNotZero64(newExec));
+                return true;
+            }
+
+            if (instruction.Opcode is "SLshlB64" or "SLshrB64" or "SAshrI64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit shift source";
+                    return false;
+                }
+
+                var shift = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    GetRawSource(instruction, 1));
+                var shiftedValue = instruction.Opcode switch
+                {
+                    "SLshlB64" => ShiftLeftLogical64(left, shift),
+                    "SLshrB64" => ShiftRightLogical64(left, shift),
+                    _ => ShiftRightArithmetic64(left, shift),
+                };
+                StoreS64(destination, shiftedValue);
+                Store(_scc, IsNotZero64(shiftedValue));
+                return true;
+            }
+
+            if (instruction.Opcode is "SBfeU64" or "SBfeI64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit bitfield source";
+                    return false;
+                }
+
+                var control = GetRawSource(instruction, 1);
+                var offset = BitwiseAnd(control, UInt(63));
+                var requestedWidth = BitwiseAnd(
+                    ShiftRightLogical(control, UInt(16)),
+                    UInt(0x7F));
+                var remaining = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _uintType,
+                    UInt(64),
+                    offset);
+                var width = Ext(
+                    38,
+                    _uintType,
+                    requestedWidth,
+                    remaining);
+                var offset64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    offset);
+                var width64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    width);
+                var one64 = _module.Constant64(_ulongType, 1);
+                var shifted = ShiftRightLogical64(left, offset64);
+                var partialMask = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _ulongType,
+                    ShiftLeftLogical64(one64, width64),
+                    one64);
+                var fullWidth = _module.AddInstruction(
+                    SpirvOp.IEqual,
+                    _boolType,
+                    width,
+                    UInt(64));
+                var mask = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _ulongType,
+                    fullWidth,
+                    _module.Constant64(_ulongType, ulong.MaxValue),
+                    partialMask);
+                var extracted = _module.AddInstruction(
+                    SpirvOp.BitwiseAnd,
+                    _ulongType,
+                    shifted,
+                    mask);
+                if (instruction.Opcode == "SBfeI64")
+                {
+                    var signShift = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        width,
+                        UInt(1));
+                    var signBit = ShiftLeftLogical64(
+                        one64,
+                        _module.AddInstruction(
+                            SpirvOp.UConvert,
+                            _ulongType,
+                            signShift));
+                    var signExtended = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _ulongType,
+                            extracted,
+                            signBit),
+                        signBit);
+                    extracted = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            width,
+                            UInt(0)),
+                        _module.Constant64(_ulongType, 0),
+                        signExtended);
+                }
+
+                StoreS64(destination, extracted);
+                Store(_scc, IsNotZero64(extracted));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBfmB64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit bitfield-mask source";
+                    return false;
+                }
+
+                var width = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var offset = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 1), UInt(63)));
+                // Width is masked to 0..63, so (1 << width) never invokes an
+                // undefined 64-bit shift. This naturally yields zero for a
+                // zero-width mask and avoids OpBitFieldInsert, which the
+                // MoltenVK/SPIRV-Cross path rejects for 64-bit integers.
+                var lowMask = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _ulongType,
+                    ShiftLeftLogical64(
+                        _module.Constant64(_ulongType, 1),
+                        width),
+                    _module.Constant64(_ulongType, 1));
+                var maskValue = ShiftLeftLogical64(lowMask, offset);
+                StoreS64(destination, maskValue);
+                Store(_scc, IsNotZero64(maskValue));
+                return true;
+            }
+
+            uint value;
+            if (instruction.Opcode == "SMovB64")
+            {
+                value = left;
+            }
+            else if (instruction.Opcode == "SCmovB64")
+            {
+                value = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _ulongType,
+                    Load(_boolType, _scc),
+                    left,
+                    LoadS64(destination));
+            }
+            else if (instruction.Opcode == "SWqmB64")
+            {
+                var quadAny = _module.AddInstruction(
+                    SpirvOp.BitwiseOr,
+                    _ulongType,
+                    left,
+                    _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        ShiftRightLogical64(left, _module.Constant64(_ulongType, 1)),
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseOr,
+                            _ulongType,
+                            ShiftRightLogical64(left, _module.Constant64(_ulongType, 2)),
+                            ShiftRightLogical64(left, _module.Constant64(_ulongType, 3)))));
+                quadAny = _module.AddInstruction(
+                    SpirvOp.BitwiseAnd,
+                    _ulongType,
+                    quadAny,
+                    _module.Constant64(_ulongType, 0x1111_1111_1111_1111UL));
+                value = _module.AddInstruction(
+                    SpirvOp.IMul,
+                    _ulongType,
+                    quadAny,
+                    _module.Constant64(_ulongType, 0xFUL));
+            }
+            else if (instruction.Opcode == "SNotB64")
+            {
+                value = _module.AddInstruction(SpirvOp.Not, _ulongType, left);
+            }
+            else if (instruction.Opcode == "SBrevB64")
+            {
+                // Vulkan limits OpBitReverse to 32-bit operands: reverse each half and swap them.
+                var low = _module.AddInstruction(SpirvOp.BitReverse, _uintType, Narrow(ShiftRightLogical64(left, ULong(32))));
+                var high = _module.AddInstruction(SpirvOp.BitReverse, _uintType, Narrow(left));
+                value = _module.AddInstruction(SpirvOp.BitwiseOr, _ulongType, Widen(low), ShiftLeftLogical64(Widen(high), ULong(32)));
+            }
+            else
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit source";
+                    return false;
+                }
+
+                var right = GetRawSource64(instruction, 1);
+                value = instruction.Opcode switch
+                {
+                    "SAndB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd, _ulongType, left, right),
+                    "SOrB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr, _ulongType, left, right),
+                    "SXorB64" => _module.AddInstruction(
+                        SpirvOp.BitwiseXor, _ulongType, left, right),
+                    "SNandB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseAnd, _ulongType, left, right)),
+                    "SNorB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseOr, _ulongType, left, right)),
+                    "SXnorB64" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _ulongType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor, _ulongType, left, right)),
+                    "SAndn1B64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, left),
+                        right),
+                    "SAndn2B64" => _module.AddInstruction(
+                        SpirvOp.BitwiseAnd,
+                        _ulongType,
+                        left,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, right)),
+                    "SOrn1B64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, left),
+                        right),
+                    "SOrn2B64" => _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        left,
+                        _module.AddInstruction(SpirvOp.Not, _ulongType, right)),
+                    "SCselectB64" => _module.AddInstruction(
+                        SpirvOp.Select,
+                        _ulongType,
+                        Load(_boolType, _scc),
+                        left,
+                        right),
+                    _ => 0,
+                };
+                if (value == 0)
+                {
+                    error = $"unsupported scalar 64-bit opcode {instruction.Opcode}";
+                    return false;
+                }
+            }
+
+            StoreS64(destination, value);
+            if (instruction.Opcode is
+                "SNotB64" or
+                "SAndB64" or
+                "SOrB64" or
+                "SXorB64" or
+                "SAndn1B64" or
+                "SAndn2B64" or
+                "SOrn1B64" or
+                "SOrn2B64" or
+                "SNandB64" or
+                "SNorB64" or
+                "SXnorB64")
+            {
+                Store(_scc, IsNotZero64(value));
+            }
+
+            return true;
+        }
+
+        private uint GetRawSource(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool applySdwaIntegerModifiers = true,
+            bool applyLaneSelection = true)
+        {
+            if ((uint)sourceIndex >= instruction.Sources.Count)
+            {
+                throw new InvalidOperationException($"missing source {sourceIndex}");
+            }
+
+            var operand = instruction.Sources[sourceIndex];
+            uint value = operand.Kind switch
+            {
+                Gen5OperandKind.VectorRegister => LoadV(operand.Value),
+                Gen5OperandKind.ScalarRegister => LoadS(operand.Value),
+                Gen5OperandKind.LiteralConstant => UInt(operand.Value),
+                Gen5OperandKind.EncodedConstant when operand.Value is >= 235 and <= 238 =>
+                    UInt((uint)(Gen5InlineConstants.DecodeAperture64(operand.Value) >> 32)),
+                Gen5OperandKind.EncodedConstant when operand.Value == 251 =>
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        LogicalNot(WaveMaskHasLanes(106)),
+                        UInt(1),
+                        UInt(0)),
+                Gen5OperandKind.EncodedConstant when operand.Value == 252 =>
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        LogicalNot(WaveMaskHasLanes(126)),
+                        UInt(1),
+                        UInt(0)),
+                Gen5OperandKind.EncodedConstant when operand.Value == 253 =>
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        Load(_boolType, _scc),
+                        UInt(1),
+                        UInt(0)),
+                Gen5OperandKind.EncodedConstant when TryDecodeInlineConstant(
+                    operand.Value,
+                    out var inline) => UInt(inline),
+                _ => throw new InvalidOperationException($"unsupported source {operand}"),
+            };
+
+            // DPP16 remaps src0 across lanes before the VALU operation. The IR
+            // has always preserved this control, but treating it as an ordinary
+            // local VGPR read breaks every wave reduction used by the XPR
+            // renderer (min/max/OR scans become value-with-self operations).
+            if (applyLaneSelection && sourceIndex == 0 &&
+                instruction.Control is Gen5DppControl dpp)
+            {
+                value = ApplyDppSource(dpp, value);
+            }
+            else if (applyLaneSelection && sourceIndex == 0 &&
+                     instruction.Control is Gen5Dpp8Control dpp8)
+            {
+                value = ApplyDpp8Source(dpp8, value);
+            }
+
+            if (instruction.Control is Gen5SdwaControl sdwa)
+            {
+                var selector = sourceIndex switch
+                {
+                    0 => sdwa.Source0Select,
+                    1 => sdwa.Source1Select,
+                    _ => 6u,
+                };
+                value = selector switch
+                {
+                    0 => BitwiseAnd(value, UInt(0xFF)),
+                    1 => BitwiseAnd(ShiftRightLogical(value, UInt(8)), UInt(0xFF)),
+                    2 => BitwiseAnd(ShiftRightLogical(value, UInt(16)), UInt(0xFF)),
+                    3 => BitwiseAnd(ShiftRightLogical(value, UInt(24)), UInt(0xFF)),
+                    4 => BitwiseAnd(value, UInt(0xFFFF)),
+                    5 => BitwiseAnd(ShiftRightLogical(value, UInt(16)), UInt(0xFFFF)),
+                    _ => value,
+                };
+                var signExtend = sourceIndex switch
+                {
+                    0 => sdwa.Source0SignExtend,
+                    1 => sdwa.Source1SignExtend,
+                    _ => false,
+                };
+                if (signExtend && selector != 6)
+                {
+                    var width = selector <= 3 ? 8u : 16u;
+                    value = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, value),
+                            UInt(0),
+                            UInt(width)));
+                }
+
+                if (applySdwaIntegerModifiers)
+                {
+                    // SDWA ABS/NEG are floating-point sign-bit modifiers even on
+                    // a bit-move opcode: ABS clears the sign bit, NEG flips it.
+                    // Two's-complement negating the raw bits instead turns 1.0
+                    // into -4.0 and -3.0 into 1.5, which silently skews every
+                    // pass that y-flips its clip position with an SDWA-negated
+                    // V_MOV_B32 - the whole of UE's DrawRectangle.
+                    var signBit = selector switch
+                    {
+                        <= 3 => 0x80u,
+                        4 or 5 => 0x8000u,
+                        _ => 0x80000000u,
+                    };
+
+                    if ((sdwa.AbsoluteMask & (1u << sourceIndex)) != 0)
+                    {
+                        value = BitwiseAnd(value, UInt(~signBit));
+                    }
+
+                    if ((sdwa.NegateMask & (1u << sourceIndex)) != 0)
+                    {
+                        value = _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _uintType,
+                            value,
+                            UInt(signBit));
+                    }
+                }
+            }
+
+            return value;
+        }
+
+        private uint GetSignModifiedSource(Gen5ShaderInstruction instruction, int sourceIndex)
+        {
+            var value = GetRawSource(instruction, sourceIndex);
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                return value;
+            }
+
+            if ((control.AbsoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = BitwiseAnd(value, UInt(0x7FFFFFFFu));
+            }
+
+            return (control.NegateMask & (1u << sourceIndex)) != 0
+                ? BitwiseXor(value, UInt(0x80000000u))
+                : value;
+        }
+
+        private uint ApplyDpp8Source(Gen5Dpp8Control control, uint value)
+        {
+            var lane = GuestWaveLane();
+            var laneInGroup = BitwiseAnd(lane, UInt(7));
+            var selector = UInt(control.LaneSelectors & 7);
+            for (var index = 1u; index < 8; index++)
+            {
+                selector = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        laneInGroup,
+                        UInt(index)),
+                    UInt((control.LaneSelectors >> checked((int)(index * 3))) & 7),
+                    selector);
+            }
+
+            var targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFF8)), selector);
+            targetLane = BitwiseAnd(targetLane, UInt(NativeLaneMask));
+            if (HostSubgroupMayBePartial)
+            {
+                if (control.FetchInactive)
+                {
+                    return ReadGraphicsLane(value, targetLane, out _);
+                }
+
+                var graphicsValue = ReadGraphicsLaneIfActive(value, targetLane, out var usable);
+                return _module.AddInstruction(SpirvOp.Select, _uintType, usable, graphicsValue, UInt(0));
+            }
+
+            var shuffled = ShuffleLane(value, targetLane);
+            if (control.FetchInactive)
+            {
+                return shuffled;
+            }
+
+            var activeWord = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                UInt(1),
+                UInt(0));
+            var sourceActive = IsNotZero(
+                ShuffleLane(activeWord, targetLane));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceActive,
+                shuffled,
+                UInt(0));
+        }
+
+        private uint ApplyDppSource(Gen5DppControl control, uint value)
+        {
+            if (HostSubgroupMayBePartial)
+            {
+                GetDppSourceLane(control, out var targetLane, out var inRange);
+                var graphicsTarget = BitwiseAnd(
+                    _module.AddInstruction(SpirvOp.Select, _uintType, inRange, targetLane, GuestWaveLane()),
+                    UInt(NativeLaneMask));
+                if (control.FetchInactive)
+                {
+                    return _module.AddInstruction(
+                        SpirvOp.Select, _uintType, inRange, ReadGraphicsLane(value, graphicsTarget, out _), UInt(0));
+                }
+
+                var graphicsValue = ReadGraphicsLaneIfActive(value, graphicsTarget, out var usable);
+                return _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, inRange, usable),
+                    graphicsValue,
+                    UInt(0));
+            }
+
+            GetDppSource(control, out var safeTarget, out var valid);
+            var shuffled = _pairedMeshLanes
+                ? ShufflePairedValue(_pairedDppSources[0], _pairedDppSources[1], safeTarget)
+                : ShuffleLane(value, safeTarget);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                valid,
+                shuffled,
+                UInt(0));
+        }
+
+        // DPP16: the lane src0 is read from (the reading lane itself when the source is invalid) and whether the source is
+        // valid: in range, and active in the guest unless FI (fetch inactive) is set. An invalid source reads as zero;
+        // without BOUND_CTRL it also leaves the destination unwritten (IsDppWriteEnabled).
+        private void GetDppSource(Gen5DppControl control, out uint safeTarget, out uint valid)
+        {
+            GetDppSourceLane(control, out var targetLane, out var inRange);
+            if (!_pairedMeshLanes && _waveLowering is NativeWave32Lowering && _subgroupInvocationIdInput != 0)
+            {
+                // A ballot names the lanes that can be read: an invocation missing from the host subgroup (a fragment warp
+                // that is not full) is never shuffled from, and without FI neither is a lane the guest has inactive.
+                _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
+                var readable = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformBallot,
+                    _uvec4Type,
+                    UInt(3),
+                    control.FetchInactive ? _module.ConstantBool(true) : Load(_boolType, _exec));
+                var target = BitwiseAnd(targetLane, UInt(31));
+                valid = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    inRange,
+                    _module.AddInstruction(SpirvOp.GroupNonUniformBallotBitExtract, _boolType, UInt(3), readable, target));
+                safeTarget = BitwiseAnd(
+                    _module.AddInstruction(SpirvOp.Select, _uintType, valid, target, GuestWaveLane()),
+                    UInt(NativeLaneMask));
+                return;
+            }
+
+            safeTarget = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                inRange,
+                targetLane,
+                GuestWaveLane());
+            if (!_pairedMeshLanes)
+            {
+                safeTarget = BitwiseAnd(safeTarget, UInt(NativeLaneMask));
+            }
+
+            valid = inRange;
+            if (!control.FetchInactive)
+            {
+                var activeWord = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    Load(_boolType, _exec),
+                    UInt(1),
+                    UInt(0));
+                var shuffledActive = _pairedMeshLanes
+                    ? ShufflePairedValue(_pairedActiveWords[0], _pairedActiveWords[1], safeTarget)
+                    : ShuffleLane(activeWord, safeTarget);
+                valid = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    valid,
+                    IsNotZero(shuffledActive));
+            }
+        }
+
+        private uint ApplySdwaDestination(
+            Gen5SdwaControl control,
+            uint value,
+            uint previous)
+        {
+            var (shift, width) = control.DestinationSelect switch
+            {
+                0 => (0u, 8u),
+                1 => (8u, 8u),
+                2 => (16u, 8u),
+                3 => (24u, 8u),
+                4 => (0u, 16u),
+                5 => (16u, 16u),
+                _ => (0u, 32u),
+            };
+            if (width == 32)
+            {
+                return value;
+            }
+
+            var lowMask = width == 8 ? 0xFFu : 0xFFFFu;
+            var fieldMask = lowMask << checked((int)shift);
+            var upperStart = shift + width;
+            var upperMask = upperStart == 32
+                ? 0u
+                : uint.MaxValue << checked((int)upperStart);
+            var positioned = ShiftLeftLogical(
+                BitwiseAnd(value, UInt(lowMask)),
+                UInt(shift));
+            return control.DestinationUnused switch
+            {
+                0 => positioned,
+                1 => BitwiseOr(
+                    positioned,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        IsNotZero(BitwiseAnd(positioned, UInt(1u << checked((int)(shift + width - 1))))),
+                        UInt(upperMask),
+                        UInt(0))),
+                2 => BitwiseOr(
+                    BitwiseAnd(previous, UInt(~fieldMask)),
+                    positioned),
+                _ => throw new InvalidOperationException("reserved SDWA destination-unused mode"),
+            };
+        }
+
+        private static bool IsSupportedDppControl(uint control) =>
+            control <= 0xFF ||
+            control is >= 0x101 and <= 0x10F or
+                >= 0x111 and <= 0x11F or
+                >= 0x121 and <= 0x12F or
+                0x140 or 0x141 or
+                >= 0x150 and <= 0x15F or
+                >= 0x160 and <= 0x16F;
+
+        private void GetDppSourceLane(
+            Gen5DppControl control,
+            out uint targetLane,
+            out uint inRange)
+        {
+            var lane = GuestWaveLane();
+            var rowBase = BitwiseAnd(lane, UInt(0xFFFF_FFF0));
+            var rowLane = BitwiseAnd(lane, UInt(15));
+            var dpp = control.Control;
+            inRange = _module.ConstantBool(true);
+
+            if (dpp <= 0xFF)
+            {
+                var quadLane = BitwiseAnd(lane, UInt(3));
+                var selected = UInt(dpp & 3);
+                for (var index = 1u; index < 4; index++)
+                {
+                    selected = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            quadLane,
+                            UInt(index)),
+                        UInt((dpp >> checked((int)(index * 2))) & 3),
+                        selected);
+                }
+
+                targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFFC)), selected);
+                return;
+            }
+
+            if (dpp is >= 0x101 and <= 0x10F)
+            {
+                var shift = UInt(dpp & 15);
+                var shifted = IAdd(rowLane, shift);
+                inRange = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    shifted,
+                    UInt(16));
+                targetLane = IAdd(rowBase, BitwiseAnd(shifted, UInt(15)));
+                return;
+            }
+
+            if (dpp is >= 0x111 and <= 0x11F)
+            {
+                var shift = UInt(dpp & 15);
+                inRange = _module.AddInstruction(
+                    SpirvOp.UGreaterThanEqual,
+                    _boolType,
+                    rowLane,
+                    shift);
+                targetLane = IAdd(
+                    rowBase,
+                    BitwiseAnd(
+                        _module.AddInstruction(SpirvOp.ISub, _uintType, rowLane, shift),
+                        UInt(15)));
+                return;
+            }
+
+            if (dpp is >= 0x121 and <= 0x12F)
+            {
+                targetLane = IAdd(
+                    rowBase,
+                    BitwiseAnd(
+                        _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            rowLane,
+                            UInt(dpp & 15)),
+                        UInt(15)));
+                return;
+            }
+
+            targetLane = dpp switch
+            {
+                0x140 => IAdd(rowBase, _module.AddInstruction(
+                    SpirvOp.ISub, _uintType, UInt(15), rowLane)),
+                0x141 => IAdd(
+                    BitwiseAnd(lane, UInt(0xFFFF_FFF8)),
+                    _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(7),
+                        BitwiseAnd(lane, UInt(7)))),
+                >= 0x150 and <= 0x15F => IAdd(rowBase, UInt(dpp & 15)),
+                >= 0x160 and <= 0x16F => IAdd(
+                    rowBase,
+                    BitwiseXor(rowLane, UInt(dpp & 15))),
+                _ => lane,
+            };
+        }
+
+        private uint IsDppWriteEnabled(Gen5DppControl control)
+        {
+            var lane = GuestWaveLane();
+            var row = ShiftRightLogical(lane, UInt(4));
+            // A bank is four consecutive lanes of each row (RDNA2 ISA, table 90).
+            var bank = BitwiseAnd(ShiftRightLogical(lane, UInt(2)), UInt(3));
+            var rowEnabled = IsNotZero(BitwiseAnd(
+                UInt(control.RowMask),
+                ShiftLeftLogical(UInt(1), row)));
+            var bankEnabled = IsNotZero(BitwiseAnd(
+                UInt(control.BankMask),
+                ShiftLeftLogical(UInt(1), bank)));
+            var sourceAllowsWrite = _module.ConstantBool(true);
+            if (!control.BoundControl && HostSubgroupMayBePartial)
+            {
+                // ISA: with BOUND_CTRL clear, a lane whose source is out of range or disabled keeps its
+                // old destination. A graphics source lane the host never launched is disabled unless
+                // whole-wave code turned it on.
+                GetDppSourceLane(control, out var sourceLane, out var inRange);
+                sourceAllowsWrite = inRange;
+                if (!control.FetchInactive)
+                {
+                    var safeSource = BitwiseAnd(
+                        _module.AddInstruction(SpirvOp.Select, _uintType, inRange, sourceLane, lane),
+                        UInt(NativeLaneMask));
+                    sourceAllowsWrite = _module.AddInstruction(
+                        SpirvOp.LogicalAnd, _boolType, inRange, IsGraphicsLaneUsable(safeSource));
+                }
+            }
+            else if (!control.BoundControl)
+            {
+                GetDppSource(control, out _, out sourceAllowsWrite);
+            }
+            return _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                rowEnabled,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    bankEnabled,
+                    sourceAllowsWrite));
+        }
+
+        private uint GetInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool signed)
+        {
+            var value = BitwiseAnd(GetRawSource(instruction, sourceIndex), UInt(0xFFFF));
+            return signed
+                ? ShiftRightArithmetic(ShiftLeftLogical(value, UInt(16)), UInt(16))
+                : value;
+        }
+
+        private uint GetFloat16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var operand = instruction.Sources[sourceIndex];
+            uint value;
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                operand.Value is >= 128 and <= 192)
+            {
+                value = Float(operand.Value - 128);
+            }
+            else if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                     operand.Value is >= 193 and <= 208)
+            {
+                value = Float(-(operand.Value - 192));
+            }
+            else if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                     Gen5InlineConstants.TryDecode(operand.Value, out var inline))
+            {
+                value = Bitcast(_floatType, UInt(inline));
+            }
+            else
+            {
+                var raw = GetRawSource(
+                    instruction,
+                    sourceIndex,
+                    applySdwaIntegerModifiers: false);
+                value = Bitcast(_floatType, EmitHalfToFloat(raw,
+                    instruction.Control is Gen5Vop3Control control && (control.OperandSelect & (1u << sourceIndex)) != 0));
+            }
+
+            uint absoluteMask = 0;
+            uint negateMask = 0;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+                case Gen5SdwaControl control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+                case Gen5DppControl control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+            }
+
+            if ((absoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = Ext(4, _floatType, value);
+            }
+
+            return (negateMask & (1u << sourceIndex)) != 0
+                ? _module.AddInstruction(SpirvOp.FNegate, _floatType, value)
+                : value;
+        }
+
+        private uint GetFloatSource(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var operand = instruction.Sources[sourceIndex];
+            uint value;
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                operand.Value is >= 128 and <= 192)
+            {
+                value = Float(operand.Value - 128);
+            }
+            else if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                     operand.Value is >= 193 and <= 208)
+            {
+                value = Float(-(operand.Value - 192));
+            }
+            else
+            {
+                value = Bitcast(
+                    _floatType,
+                    GetRawSource(
+                        instruction,
+                        sourceIndex,
+                        applySdwaIntegerModifiers: false));
+            }
+
+            uint absoluteMask = 0;
+            uint negateMask = 0;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+                case Gen5SdwaControl control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+                case Gen5DppControl control:
+                    absoluteMask = control.AbsoluteMask;
+                    negateMask = control.NegateMask;
+                    break;
+            }
+
+            if ((absoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = Ext(4, _floatType, value);
+            }
+
+            if ((negateMask & (1u << sourceIndex)) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
+            }
+
+            return value;
+        }
+
+        private uint GetRawSource64(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var operand = instruction.Sources[sourceIndex];
+            if (operand.Kind == Gen5OperandKind.ScalarRegister)
+            {
+                return LoadS64(operand.Value);
+            }
+
+            if (operand.Kind == Gen5OperandKind.VectorRegister)
+            {
+                var vectorLow = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    LoadV(operand.Value));
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    LoadV(operand.Value + 1));
+                high = ShiftLeftLogical64(
+                    high,
+                    _module.Constant64(_ulongType, 32));
+                return _module.AddInstruction(
+                    SpirvOp.BitwiseOr,
+                    _ulongType,
+                    vectorLow,
+                    high);
+            }
+
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                Gen5InlineConstants.IsAperture(operand.Value))
+            {
+                return _module.Constant64(_ulongType, Gen5InlineConstants.DecodeAperture64(operand.Value));
+            }
+
+            // Scalar inline negative constants are signed immediates. B64
+            // consumers sign-extend them, so -1 denotes a full 64-bit mask.
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                operand.Value is >= 193 and <= 208)
+            {
+                var signed = -(long)(operand.Value - 192);
+                return _module.Constant64(_ulongType, unchecked((ulong)signed));
+            }
+
+            var low = GetRawSource(instruction, sourceIndex);
+            return _module.AddInstruction(SpirvOp.UConvert, _ulongType, low);
+        }
+
+        private uint LoadS64(uint register)
+        {
+            var low = _module.AddInstruction(SpirvOp.UConvert, _ulongType, LoadS(register));
+            var high = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _ulongType,
+                LoadS(register + 1));
+            high = ShiftLeftLogical64(high, _module.Constant64(_ulongType, 32));
+            return _module.AddInstruction(SpirvOp.BitwiseOr, _ulongType, low, high);
+        }
+
+        private void StoreS64(uint register, uint value)
+        {
+            if (_pairedLanes && _inLanePass)
+            {
+                StorePairedLaneMaskWord(register, value);
+                return;
+            }
+
+            StoreS(
+                register,
+                _module.AddInstruction(SpirvOp.UConvert, _uintType, value));
+            var high = ShiftRightLogical64(
+                value,
+                _module.Constant64(_ulongType, 32));
+            StoreS(
+                register + 1,
+                _module.AddInstruction(SpirvOp.UConvert, _uintType, high));
+        }
+
+        private uint DoubleType()
+        {
+            _module.AddCapability(SpirvCapability.Float64);
+            return _module.TypeFloat(64);
+        }
+
+        private uint Double(double value) =>
+            _module.Constant64(
+                DoubleType(),
+                unchecked((ulong)BitConverter.DoubleToInt64Bits(value)));
+
+        private bool TryGetDoubleSource(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            out uint value,
+            out string error)
+        {
+            error = string.Empty;
+            value = 0;
+            var operand = instruction.Sources[sourceIndex];
+            if (operand.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister)
+            {
+                value = Bitcast(DoubleType(), GetRawSource64(instruction, sourceIndex));
+            }
+            else if (TryGetDoubleConstantBits(operand, out var bits))
+            {
+                value = _module.Constant64(DoubleType(), bits);
+            }
+            else
+            {
+                error = $"FP64 source {sourceIndex} of {instruction.Opcode} is not a register pair or a 64-bit constant";
+                return false;
+            }
+
+            var absoluteMask = 0u;
+            var negateMask = 0u;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control vop3:
+                    absoluteMask = vop3.AbsoluteMask;
+                    negateMask = vop3.NegateMask;
+                    break;
+                case Gen5SdwaControl sdwa:
+                    absoluteMask = sdwa.AbsoluteMask;
+                    negateMask = sdwa.NegateMask;
+                    break;
+            }
+
+            if ((absoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = Ext(4, DoubleType(), value);
+            }
+
+            if ((negateMask & (1u << sourceIndex)) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, DoubleType(), value);
+            }
+
+            return true;
+        }
+
+        private static bool TryGetDoubleConstantBits(Gen5Operand operand, out ulong bits)
+        {
+            bits = 0;
+            if (operand.Kind == Gen5OperandKind.LiteralConstant)
+            {
+                bits = (ulong)operand.Value << 32;
+                return true;
+            }
+
+            if (operand.Kind != Gen5OperandKind.EncodedConstant)
+            {
+                return false;
+            }
+
+            double? floating = operand.Value switch
+            {
+                240 => 0.5,
+                241 => -0.5,
+                242 => 1.0,
+                243 => -1.0,
+                244 => 2.0,
+                245 => -2.0,
+                246 => 4.0,
+                247 => -4.0,
+                248 => 0.15915494309189535,
+                _ => null,
+            };
+            if (floating is { } constant)
+            {
+                bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(constant));
+                return true;
+            }
+
+            if (operand.Value is >= 128 and <= 192)
+            {
+                bits = operand.Value - 128;
+                return true;
+            }
+
+            if (operand.Value is >= 193 and <= 208)
+            {
+                bits = unchecked((ulong)-(long)(operand.Value - 192));
+                return true;
+            }
+
+            return false;
+        }
+
+        // Applies the VOP3 output modifier and clamp to a double result, then
+        // splits it across the destination register pair. The low word is
+        // returned for the caller's common destination store; the high word is
+        // stored here so both words share the same EXEC guard.
+        private bool TryStoreDoubleResult(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint doubleValue,
+            out uint low,
+            out string error)
+        {
+            error = string.Empty;
+            low = 0;
+            var outputModifier = 0u;
+            var clamp = false;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control control:
+                    outputModifier = control.OutputModifier;
+                    clamp = control.Clamp;
+                    break;
+                case null:
+                    break;
+                default:
+                    error = $"FP64 output control {instruction.Control.GetType().Name} is not implemented in {instruction.Opcode}";
+                    return false;
+            }
+
+            var type = DoubleType();
+            doubleValue = outputModifier switch
+            {
+                1 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(2.0)),
+                2 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(4.0)),
+                3 => _module.AddInstruction(SpirvOp.FMul, type, doubleValue, Double(0.5)),
+                _ => doubleValue,
+            };
+            if (clamp)
+            {
+                doubleValue = Ext(81, type, doubleValue, Double(0.0), Double(1.0));
+            }
+
+            var bits = Bitcast(_ulongType, doubleValue);
+            var high = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(bits, _module.Constant64(_ulongType, 32)));
+            StoreV(destination + 1, high);
+            low = _module.AddInstruction(SpirvOp.UConvert, _uintType, bits);
+            return true;
+        }
+
+        private uint EmitFloat16Binary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            SpirvOp operation,
+            bool reverse = false)
+        {
+            if (TryGetNativeHalfSources(instruction, 2, selects: false, out var halves))
+            {
+                return EmitNativeHalfResult(instruction, destination,
+                    _module.AddInstruction(operation, _halfType, halves[reverse ? 1 : 0], halves[reverse ? 0 : 1]));
+            }
+
+            var left = GetFloat16Source(instruction, reverse ? 1 : 0);
+            var right = GetFloat16Source(instruction, reverse ? 0 : 1);
+            return EmitFloat16Result(
+                instruction,
+                destination,
+                _module.AddInstruction(operation, _floatType, left, right));
+        }
+
+        private uint EmitFloat16ExtBinary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint operation) =>
+            TryGetNativeHalfSources(instruction, 2, selects: true, out var halves)
+                ? EmitNativeHalfResult(instruction, destination, NanIgnoringMinMax(operation, halves[0], halves[1], _halfType))
+                : EmitFloat16Result(
+                    instruction,
+                    destination,
+                    NanIgnoringMinMax(
+                        operation,
+                        GetFloat16Source(instruction, 0),
+                        GetFloat16Source(instruction, 1)));
+
+        private uint EmitFloatBinary(
+            Gen5ShaderInstruction instruction,
+            SpirvOp operation,
+            bool reverse = false)
+        {
+            var left = GetFloatSource(instruction, reverse ? 1 : 0);
+            var right = GetFloatSource(instruction, reverse ? 0 : 1);
+            return EmitFloatResult(
+                instruction,
+                _module.AddInstruction(operation, _floatType, left, right));
+        }
+
+        // v_min_f32 and v_max_f32 return the other operand when one is NaN. GLSL FMin and FMax
+        // leave that undefined, and Metal's fast math returns the NaN.
+        private uint EmitFloatExtBinary(
+            Gen5ShaderInstruction instruction,
+            uint operation) =>
+            EmitFloatResult(
+                instruction,
+                NanIgnoringMinMax(
+                    operation,
+                    GetFloatSource(instruction, 0),
+                    GetFloatSource(instruction, 1)));
+
+        // v_med3_f32 with a NaN operand is v_min3_f32 (RDNA2 ISA). Without one no intermediate is NaN, so plain FMin and FMax
+        // give the median the NaN-ignoring forms would.
+        private uint EmitFloatMedian(uint a, uint b, uint c, uint type = 0)
+        {
+            type = type == 0 ? _floatType : type;
+            var anyNan = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                IsNan(a, type),
+                _module.AddInstruction(SpirvOp.LogicalOr, _boolType, IsNan(b, type), IsNan(c, type)));
+            var median = Ext(40, type, Ext(37, type, a, b), Ext(37, type, Ext(40, type, a, b), c));
+            return _module.AddInstruction(SpirvOp.Select, type, anyNan,
+                NanIgnoringMinMax(37, NanIgnoringMinMax(37, a, b, type), c, type), median);
+        }
+
+        private uint EmitFloatTernaryExt(
+            Gen5ShaderInstruction instruction,
+            uint operation)
+        {
+            var first = NanIgnoringMinMax(
+                operation,
+                GetFloatSource(instruction, 0),
+                GetFloatSource(instruction, 1));
+            return EmitFloatResult(
+                instruction,
+                NanIgnoringMinMax(operation, first, GetFloatSource(instruction, 2)));
+        }
+
+        private uint NanIgnoringMinMax(uint operation, uint left, uint right, uint type = 0)
+        {
+            type = type == 0 ? _floatType : type;
+            var result = Ext(operation, type, left, right);
+            result = _module.AddInstruction(SpirvOp.Select, type, IsNan(right, type), left, result);
+            return _module.AddInstruction(SpirvOp.Select, type, IsNan(left, type), right, result);
+        }
+
+        // A module that declares SignedZeroInfNanPreserve keeps OpIsNan exact; without it a driver may assume no NaN, and
+        // the test reads the bits. A native f16 value is under the 16-bit float controls.
+        private uint IsNan(uint value, uint type = 0) =>
+            _request.ShaderSignedZeroInfNanPreserveFloat32Supported || (type != 0 && type == _halfType)
+                ? _module.AddInstruction(SpirvOp.IsNan, _boolType, value)
+                : IsNanBits(value);
+
+        // NaN tested on the bits, which fast math cannot assume away.
+        private uint IsNanBits(uint value) =>
+            _module.AddInstruction(
+                SpirvOp.UGreaterThan,
+                _boolType,
+                BitwiseAnd(Bitcast(_uintType, value), UInt(0x7FFF_FFFF)),
+                UInt(0x7F80_0000));
+
+        // v_cvt_u32_f32 and v_cvt_i32_f32 saturate and convert NaN to zero; SPIR-V leaves
+        // out-of-range conversions undefined.
+        private uint ConvertFloatToUnsignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var converted = _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, value);
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x4F80_0000)),
+                UInt(uint.MaxValue),
+                converted);
+            // Above +Inf as unsigned bits: a positive NaN or a negative value (negative NaN and -0 included).
+            return _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, bits, UInt(0x7F80_0000)),
+                UInt(0),
+                converted);
+        }
+
+        private uint ConvertDoubleToIntegerSaturated(uint value, bool signed)
+        {
+            var type = DoubleType();
+            var clamped = Ext(43, type, value,
+                Double(signed ? int.MinValue : 0.0),
+                Double(signed ? int.MaxValue : uint.MaxValue));
+            var converted = signed
+                ? Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, clamped))
+                : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, clamped);
+            return _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, value), UInt(0), converted);
+        }
+
+        private uint ConvertFloatToSignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var magnitude = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+            var converted = Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, value));
+            var negative = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x8000_0000));
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, magnitude, UInt(0x4F00_0000)),
+                _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(0x8000_0000), UInt(0x7FFF_FFFF)),
+                converted);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
+        }
+
+        private uint EmitIntegerBinary(
+            Gen5ShaderInstruction instruction,
+            SpirvOp operation,
+            bool reverse = false)
+        {
+            var left = GetRawSource(instruction, reverse ? 1 : 0);
+            var right = GetRawSource(instruction, reverse ? 0 : 1);
+            if (operation == SpirvOp.ShiftLeftLogical)
+            {
+                return ShiftLeftLogical(left, right);
+            }
+
+            if (operation == SpirvOp.ShiftRightLogical)
+            {
+                return ShiftRightLogical(left, right);
+            }
+
+            if (operation == SpirvOp.ShiftRightArithmetic)
+            {
+                return ShiftRightArithmetic(left, right);
+            }
+
+            return _module.AddInstruction(operation, _uintType, left, right);
+        }
+
+        private uint EmitInteger16Binary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            SpirvOp operation)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var left = GetRawSource(instruction, 0, applySdwaIntegerModifiers: false);
+            var right = GetRawSource(instruction, 1, applySdwaIntegerModifiers: false);
+
+            if ((control?.OperandSelect & 0x1) != 0)
+            {
+                left = ShiftRightLogical(left, UInt(16));
+            }
+
+            if ((control?.OperandSelect & 0x2) != 0)
+            {
+                right = ShiftRightLogical(right, UInt(16));
+            }
+
+            left = BitwiseAnd(left, UInt(0xFFFF));
+            right = BitwiseAnd(right, UInt(0xFFFF));
+            var value = _module.AddInstruction(operation, _uintType, left, right);
+            if (control?.Clamp == true && operation == SpirvOp.IAdd)
+            {
+                // The clamp bit saturates V_ADD_NC_U16 in the unsigned 16-bit domain.
+                value = Ext(38, _uintType, value, UInt(0xFFFF));
+            }
+
+            var low16 = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+
+            return (control?.OperandSelect & 0x8) != 0
+                ? BitwiseOr(
+                    BitwiseAnd(current, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(low16, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(current, UInt(0xFFFF_0000)),
+                    low16);
+        }
+
+        private enum CubeCoordinate
+        {
+            Id,
+            Sc,
+            Tc,
+            Ma,
+        }
+
+        private uint EmitCvtOffF32I4(Gen5ShaderInstruction instruction)
+        {
+            var index = BitwiseAnd(GetRawSource(instruction, 0), UInt(15));
+            ReadOnlySpan<float> table =
+            [
+                0.0f,
+                0.0625f,
+                0.1250f,
+                0.1875f,
+                0.2500f,
+                0.3125f,
+                0.3750f,
+                0.4375f,
+                -0.5000f,
+                -0.4375f,
+                -0.3750f,
+                -0.3125f,
+                -0.2500f,
+                -0.1875f,
+                -0.1250f,
+                -0.0625f,
+            ];
+
+            var result = UInt(BitConverter.SingleToUInt32Bits(table[^1]));
+            for (var tableIndex = table.Length - 2; tableIndex >= 0; tableIndex--)
+            {
+                var matches = _module.AddInstruction(
+                    SpirvOp.IEqual,
+                    _boolType,
+                    index,
+                    UInt((uint)tableIndex));
+                result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    matches,
+                    UInt(BitConverter.SingleToUInt32Bits(table[tableIndex])),
+                    result);
+            }
+
+            return result;
+        }
+
+        private uint EmitCubeCoordinate(
+            Gen5ShaderInstruction instruction,
+            CubeCoordinate coordinate)
+        {
+            var x = GetFloatSource(instruction, 0);
+            var y = GetFloatSource(instruction, 1);
+            var z = GetFloatSource(instruction, 2);
+            var nx = _module.AddInstruction(SpirvOp.FNegate, _floatType, x);
+            var ny = _module.AddInstruction(SpirvOp.FNegate, _floatType, y);
+            var nz = _module.AddInstruction(SpirvOp.FNegate, _floatType, z);
+            var ax = Ext(4, _floatType, x);
+            var ay = Ext(4, _floatType, y);
+            var az = Ext(4, _floatType, z);
+            var amaxXY = Ext(40, _floatType, ax, ay);
+            var amax = Ext(40, _floatType, az, amaxXY);
+            var ma = _module.AddInstruction(
+                SpirvOp.FMul,
+                _floatType,
+                Float(2),
+                amax);
+            if (coordinate == CubeCoordinate.Ma)
+            {
+                return EmitFloatResult(instruction, ma);
+            }
+
+            var isZMax = _module.AddInstruction(
+                SpirvOp.FOrdGreaterThanEqual,
+                _boolType,
+                az,
+                amaxXY);
+            var yGreaterOrEqualX = _module.AddInstruction(
+                SpirvOp.FOrdGreaterThanEqual,
+                _boolType,
+                ay,
+                ax);
+            var isYMax = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                _module.AddInstruction(SpirvOp.LogicalNot, _boolType, isZMax),
+                yGreaterOrEqualX);
+            if (coordinate == CubeCoordinate.Id)
+            {
+                var isZNeg = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    z,
+                    Float(0));
+                var isYNeg = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    y,
+                    Float(0));
+                var isXNeg = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    x,
+                    Float(0));
+                var zCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isZNeg,
+                    Float(5),
+                    Float(4));
+                var yCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isYNeg,
+                    Float(3),
+                    Float(2));
+                var xCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isXNeg,
+                    Float(1),
+                    Float(0));
+                var xyCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    yGreaterOrEqualX,
+                    yCase,
+                    xCase);
+                return EmitFloatResult(
+                    instruction,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        isZMax,
+                        zCase,
+                        xyCase));
+            }
+
+            if (coordinate == CubeCoordinate.Sc)
+            {
+                var isZNeg = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    z,
+                    Float(0));
+                var isXNeg = _module.AddInstruction(
+                    SpirvOp.FOrdLessThan,
+                    _boolType,
+                    x,
+                    Float(0));
+                var zCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isZNeg,
+                    nx,
+                    x);
+                var xCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isXNeg,
+                    z,
+                    nz);
+                var nonZCase = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isYMax,
+                    x,
+                    xCase);
+                return EmitFloatResult(
+                    instruction,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        isZMax,
+                        zCase,
+                        nonZCase));
+            }
+
+            var tcIsYNeg = _module.AddInstruction(
+                SpirvOp.FOrdLessThan,
+                _boolType,
+                y,
+                Float(0));
+            var tcYCase = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                tcIsYNeg,
+                nz,
+                z);
+            return EmitFloatResult(
+                instruction,
+                _module.AddInstruction(
+                    SpirvOp.Select,
+                    _floatType,
+                    isYMax,
+                    tcYCase,
+                    ny));
+        }
+
+        private uint EmitAddWithCarry(Gen5ShaderInstruction instruction)
+        {
+            var left = GetRawSource(instruction, 0);
+            var right = GetRawSource(instruction, 1);
+            var carryMask = instruction.Sources.Count > 2
+                ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                : Load(_boolType, _vcc);
+            var carryIn = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                carryMask,
+                UInt(1),
+                UInt(0));
+            var partial = IAdd(left, right);
+            var result = IAdd(partial, carryIn);
+            var carry = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
+            StoreCarryOut(instruction, carry);
+            return result;
+        }
+
+        private uint EmitSubtractWithBorrow(
+            Gen5ShaderInstruction instruction,
+            bool reverse)
+        {
+            var left = GetRawSource(instruction, reverse ? 1 : 0);
+            var right = GetRawSource(instruction, reverse ? 0 : 1);
+            var borrowMask = instruction.Sources.Count > 2
+                ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                : Load(_boolType, _vcc);
+            var borrowIn = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                borrowMask,
+                UInt(1),
+                UInt(0));
+            var partial = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+            var result = _module.AddInstruction(
+                SpirvOp.ISub,
+                _uintType,
+                partial,
+                borrowIn);
+            var borrow = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, left, right),
+                _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    partial,
+                    borrowIn));
+            StoreCarryOut(instruction, borrow);
+            return result;
+        }
+
+        // A lane selector reduced to the guest wave: bits [5:0] for wave64, [4:0] for wave32.
+        private uint GuestLaneSelect(uint selector) =>
+            BitwiseAnd(selector, UInt(_waveLaneCount == 64 ? 63u : RdnaWaveLaneCount - 1));
+
+        private void StoreCarryOut(
+            Gen5ShaderInstruction instruction,
+            uint carry)
+        {
+            var activeCarry = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                carry);
+            if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } register })
+            {
+                StoreWaveMask(register, activeCarry);
+                return;
+            }
+
+            StoreWaveMask(106, activeCarry);
+        }
+
+        private bool TryEmitReadlane(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = "VReadlaneB32 expects scalar destination";
+                return false;
+            }
+
+            var destination = instruction.Destinations[0].Value;
+            if (!_pairedLanes && instruction.Sources[0] is { Kind: Gen5OperandKind.VectorRegister } sourceRegister &&
+                TryGetFixedLane(instruction.Sources[1], out var savedLane) &&
+                _savedLaneValues.TryGetValue(sourceRegister.Value, out var savedValues) &&
+                savedValues.TryGetValue(savedLane, out var savedValue))
+            {
+                StoreS(destination, savedValue);
+                return true;
+            }
+            var selectedLane = BitwiseAnd(GetRawSource(instruction, 1), UInt(LaneSelectMask));
+            if (_pairedLanes)
+            {
+                StoreS(destination, PairedReadLaneOrSpillSlot(instruction, selectedLane));
+                return true;
+            }
+
+            var sourceValue = GetRawSource(instruction, 0);
+
+            if (_stage == Gen5SpirvStage.Compute && _waveLowering is EmulatedWave64Lowering emulated)
+            {
+                // The selected guest lane can belong to another host subgroup.
+                // Read it even when the guest execution mask disables that lane.
+                // A lane past the thread count does not run; a scalar V_WRITELANE spilled to it is in the spill slot.
+                var broadcast = BroadcastWaveLane(sourceValue, selectedLane);
+                var spilled = ReadLaneSpillSlot(instruction, selectedLane, broadcast);
+                StoreS(destination, spilled == broadcast
+                    ? broadcast
+                    : _module.AddInstruction(SpirvOp.Select, _uintType, emulated.LaneRuns(selectedLane), broadcast, spilled));
+            }
+            else if (_subgroupInvocationIdInput != 0 && _stage is Gen5SpirvStage.Compute or Gen5SpirvStage.Mesh)
+            {
+                // A mesh wave is a host subgroup too, so the selected lane is readable.
+                var broadcast = BroadcastWaveLane(sourceValue, selectedLane);
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, broadcast));
+            }
+            else if (HostSubgroupMayBePartial)
+            {
+                // The selected lane of the invocation's own graphics wave, whatever its EXEC state; a lane
+                // the host never launched reads as the reading lane.
+                var read = ReadGraphicsLane(sourceValue, selectedLane, out _);
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, read));
+            }
+            else
+            {
+                // Fallback: no subgroup ops, read current lane's value, or the
+                // spill slot that V_WRITELANE filled for the selected lane.
+                StoreS(destination, ReadLaneSpillSlot(instruction, selectedLane, sourceValue));
+            }
+
+            return true;
+        }
+
+        private bool TryGetFixedLane(Gen5Operand operand, out uint lane)
+        {
+            lane = operand.Value;
+            if (operand.Kind == Gen5OperandKind.EncodedConstant && operand.Value is >= 128 and <= 192)
+                lane -= 128;
+            else if (operand.Kind == Gen5OperandKind.EncodedConstant && operand.Value is >= 193 and <= 208)
+                lane = unchecked(192u - operand.Value);
+            else if (operand.Kind != Gen5OperandKind.LiteralConstant)
+                return false;
+            lane &= _waveLaneCount - 1;
+            return true;
+        }
+
+        private uint NativeLaneMask => _waveLaneCount == 64 &&
+            (_stage != Gen5SpirvStage.Mesh || _request.Mesh?.DeviceSubgroupLaneCount == 64) ? 63u : 31u;
+
+        private uint EmitPermlane16(
+            Gen5ShaderInstruction instruction,
+            bool exchangeRows)
+        {
+            if (instruction.Control is not Gen5Vop3Control control ||
+                (control.OperandSelect & ~3u) != 0 ||
+                control.AbsoluteMask != 0 ||
+                control.NegateMask != 0 ||
+                control.OutputModifier != 0 ||
+                control.Clamp)
+            {
+                throw new InvalidOperationException(
+                    $"invalid permlane modifiers for {instruction.Opcode}");
+            }
+
+            var value = GetRawSource(instruction, 0);
+            var selectorLow = GetRawSource(instruction, 1);
+            var selectorHigh = GetRawSource(instruction, 2);
+            var lane = GuestWaveLane();
+            var localLane = BitwiseAnd(lane, UInt(15));
+            var lowHalf = _module.AddInstruction(
+                SpirvOp.ULessThan,
+                _boolType,
+                localLane,
+                UInt(8));
+            var lowShift = ShiftLeftLogical(localLane, UInt(2));
+            var highLane = _module.AddInstruction(
+                SpirvOp.ISub,
+                _uintType,
+                localLane,
+                UInt(8));
+            var highShift = ShiftLeftLogical(highLane, UInt(2));
+            var lowSelector = BitwiseAnd(
+                ShiftRightLogical(selectorLow, lowShift),
+                UInt(15));
+            var highSelector = BitwiseAnd(
+                ShiftRightLogical(selectorHigh, highShift),
+                UInt(15));
+            var selector = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                lowHalf,
+                lowSelector,
+                highSelector);
+            var rowBase = BitwiseAnd(lane, UInt(0xFFFF_FFF0));
+            if (exchangeRows)
+            {
+                rowBase = BitwiseXor(rowBase, UInt(16));
+            }
+
+            var targetLane = IAdd(rowBase, selector);
+            targetLane = BitwiseAnd(targetLane, UInt(NativeLaneMask));
+            var fetchInactive = (control.OperandSelect & 1) != 0;
+            if (HostSubgroupMayBePartial)
+            {
+                if (fetchInactive)
+                {
+                    return ReadGraphicsLane(value, targetLane, out _);
+                }
+
+                // ISA: a disabled source lane gives zero with BOUND_CTRL (OP_SEL[1]) set and keeps the old
+                // destination with it clear.
+                var graphicsValue = ReadGraphicsLaneIfActive(value, targetLane, out var usable);
+                var boundControl = (control.OperandSelect & 2) != 0;
+                return _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    usable,
+                    graphicsValue,
+                    boundControl || instruction.Destinations.Count == 0
+                        ? UInt(0)
+                        : LoadV(instruction.Destinations[0].Value));
+            }
+
+            var shuffled = ShuffleLane(value, targetLane);
+            if (fetchInactive)
+            {
+                return shuffled;
+            }
+
+            var activeWord = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                UInt(1),
+                UInt(0));
+            var sourceActive = IsNotZero(
+                ShuffleLane(activeWord, targetLane));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceActive,
+                shuffled,
+                UInt(0));
+        }
+
+        private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)
+        {
+            var raw = GetRawSource(instruction, sourceIndex, applySdwaIntegerModifiers: false);
+            if (instruction.Control is Gen5Vop3Control control && (control.OperandSelect & (1u << sourceIndex)) != 0)
+            {
+                raw = ShiftRightLogical(raw, UInt(16));
+            }
+
+            var half = BitwiseAnd(raw, UInt(0xFFFF));
+            return signed
+                ? ShiftRightArithmetic(ShiftLeftLogical(half, UInt(16)), UInt(16))
+                : half;
+        }
+
+        private uint EmitInt16Result(Gen5ShaderInstruction instruction, uint destination, uint value)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var half = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(BitwiseAnd(current, UInt(0x0000_FFFF)), ShiftLeftLogical(half, UInt(16)))
+                : BitwiseOr(BitwiseAnd(current, UInt(0xFFFF_0000)), half);
+        }
+
+        private uint EmitFloat16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint value) =>
+            EmitHalfResult(instruction, destination, EmitFloatToHalf(EmitFloatResult(instruction, value)));
+
+        // A 16-bit result is one half of the destination register: op_sel names the half and the other one stays. The
+        // conversions to a half and from a half to a 16-bit integer are 16-bit results as well, and compiled code keeps a
+        // second value in the high half across them.
+        private uint EmitHalfResult(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint half)
+        {
+            if (instruction.Control is Gen5SdwaControl)
+            {
+                // The SDWA word picks the field that takes the half and what becomes of the rest of the register.
+                return half;
+            }
+
+            var control = instruction.Control as Gen5Vop3Control;
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(
+                    BitwiseAnd(current, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(half, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(current, UInt(0xFFFF_0000)),
+                    half);
+        }
+
+        private uint EmitFloatResult(
+            Gen5ShaderInstruction instruction,
+            uint value) =>
+            Bitcast(_uintType, ApplyOutputModifiers(instruction, value));
+
+        private uint ApplyOutputModifiers(
+            Gen5ShaderInstruction instruction,
+            uint value)
+        {
+            uint outputModifier = 0;
+            var clamp = false;
+            switch (instruction.Control)
+            {
+                case Gen5Vop3Control control:
+                    outputModifier = control.OutputModifier;
+                    clamp = control.Clamp;
+                    break;
+                case Gen5SdwaControl control:
+                    outputModifier = control.OutputModifier;
+                    clamp = control.Clamp;
+                    break;
+            }
+
+            value = outputModifier switch
+            {
+                1 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(2)),
+                2 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(4)),
+                3 => _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(0.5f)),
+                _ => value,
+            };
+            if (clamp)
+            {
+                value = Ext(81, _floatType, value, Float(0), Float(1));
+            }
+
+            return value;
+        }
+
+        private uint TruncateFloat32ForPack(uint value)
+        {
+            var raw = BitwiseAnd(
+                Bitcast(_uintType, value),
+                UInt(0xFFFF_E000));
+            return Bitcast(_floatType, raw);
+        }
+
+        private uint Ext(uint operation, uint resultType, params uint[] operands)
+        {
+            var values = new uint[2 + operands.Length];
+            values[0] = _glsl;
+            values[1] = operation;
+            operands.CopyTo(values, 2);
+            return _module.AddInstruction(SpirvOp.ExtInst, resultType, values);
+        }
+
+        private uint IsNotZero(uint value) =>
+            _module.AddInstruction(SpirvOp.INotEqual, _boolType, value, UInt(0));
+
+        private uint IsNotZero64(uint value) =>
+            _module.AddInstruction(
+                SpirvOp.INotEqual,
+                _boolType,
+                value,
+                _module.Constant64(_ulongType, 0));
+
+        private uint SignBit(uint value) =>
+            ShiftRightLogical(value, UInt(31));
+
+        private uint SignedAddOverflow(uint left, uint right, uint result)
+        {
+            var leftSign = SignBit(left);
+            var rightSign = SignBit(right);
+            var resultSign = SignBit(result);
+            var sameSourceSign = _module.AddInstruction(
+                SpirvOp.IEqual,
+                _boolType,
+                leftSign,
+                rightSign);
+            var resultSignChanged = _module.AddInstruction(
+                SpirvOp.INotEqual,
+                _boolType,
+                leftSign,
+                resultSign);
+            return _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                sameSourceSign,
+                resultSignChanged);
+        }
+
+        private uint SignedSubOverflow(uint left, uint right, uint result)
+        {
+            var leftSign = SignBit(left);
+            var rightSign = SignBit(right);
+            var resultSign = SignBit(result);
+            var differentSourceSign = _module.AddInstruction(
+                SpirvOp.INotEqual,
+                _boolType,
+                leftSign,
+                rightSign);
+            var resultSignChanged = _module.AddInstruction(
+                SpirvOp.INotEqual,
+                _boolType,
+                leftSign,
+                resultSign);
+            return _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                differentSourceSign,
+                resultSignChanged);
+        }
+
+        private static bool TryDecodeInlineConstant(uint encoded, out uint value) =>
+            Gen5InlineConstants.TryDecode(encoded, out value);
+    }
+}

@@ -1,0 +1,1923 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.Core.Runtime;
+using SharpEmu.Core.Cpu;
+using SharpEmu.GnmMode;
+using SharpEmu.GUI;
+using SharpEmu.HLE;
+using SharpEmu.HLE.FileSystem;
+using SharpEmu.HLE.Host.Windows;
+using SharpEmu.Libs.VideoOut;
+using SharpEmu.Logging;
+using System.Runtime.InteropServices;
+using System.Runtime.Loader;
+using System.Text;
+using System.Text.Json;
+
+namespace SharpEmu.CLI;
+
+internal static partial class Program
+{
+    private static readonly SharpEmuLogger Log = SharpEmuLog.For("SharpEmu.CLI");
+    private static readonly object ConsoleMirrorSync = new();
+    private static StreamWriter? _consoleMirrorFile;
+    private sealed record ParsedLaunch(string Path, SharpEmuRuntimeOptions Runtime, HostVideoOptions Video, LogLevel LogLevel, string? LogFile);
+    private static ParsedLaunch? _preparedLaunch;
+    private const int DefaultImportTraceLimit = 32;
+    private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint INFINITE = 0xFFFFFFFF;
+    private const int PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = 0x00020007;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const int STARTF_USESTDHANDLES = 0x00000100;
+    private const uint HANDLE_FLAG_INHERIT = 0x00000001;
+    private const string MitigatedChildEnvironment = "SHARPEMU_MITIGATED_CHILD";
+    private const string YoungGenerationSizeEnvironment = "DOTNET_GCgen0size";
+    private const string YoungGenerationSize = "10000000";
+    private const string SurvivorGenerationBudgetEnvironment = "DOTNET_GCGen1MaxBudget";
+    private const string SurvivorGenerationBudget = "8000000";
+    private static readonly (string Name, string Value)[] ServerGarbageCollector =
+    [
+        ("DOTNET_gcServer", "1"),
+        ("DOTNET_GCHeapCount", "4"),
+        ("DOTNET_GCNoAffinitize", "1"),
+        // Guest memory keeps the machine's memory load above the GC's high-memory thresholds, where it runs a blocking
+        // compacting generation-2 collection of most of a second every few seconds. The value is hexadecimal (99 percent).
+        ("DOTNET_GCHighMemPercent", "63"),
+    ];
+    private const int ATTACH_PARENT_PROCESS = -1;
+    private const int STD_INPUT_HANDLE = -10;
+    private const int STD_OUTPUT_HANDLE = -11;
+    private const int STD_ERROR_HANDLE = -12;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint OPEN_EXISTING = 3;
+
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        ConfigureManagedPluginResolution();
+        if (args is [LaunchConfiguration.ShortcutArgument, var shortcutGame])
+        {
+            try { return ShortcutLauncher.Run(shortcutGame); }
+            finally { SharpEmuLog.Shutdown(); }
+        }
+
+        // Apply the game's settings file before anything reads the environment (the Vulkan
+        // loader setup below, and backend settings cached in static fields). Keep the result
+        // for RunEmulator so settings and relative paths are resolved once.
+        if (args.Length > 0 &&
+            args[0] != SharpEmu.Core.Diagnostics.WindowsCrashCapture.HelperArgument &&
+            args[0] != Updater.ApplyArgument)
+        {
+            var launchArgs = NormalizeInternalArguments(args, out _)
+                .Where(argument => !argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal))
+                .ToArray();
+            if (TryParseArguments(launchArgs, out var path, out var runtime, out var video, out var level, out var logFile))
+            {
+                _preparedLaunch = new(path, runtime, video, level, logFile);
+            }
+        }
+
+        if (args.Length > 0 && args[0] == SharpEmu.Core.Diagnostics.WindowsCrashCapture.HelperArgument)
+            return SharpEmu.Core.Diagnostics.WindowsCrashCapture.RunHelper(args);
+
+        RenderDocCapture.ApplyVulkanLoaderEnvironment();
+        SharpEmu.Libs.VideoOut.RenderDocCapture.Initialize();
+
+        try
+        {
+            return Run(args);
+        }
+        finally
+        {
+            DropConsoleFileMirror();
+            SharpEmuLog.Shutdown();
+        }
+    }
+
+    private static void ConfigureManagedPluginResolution()
+    {
+        AssemblyLoadContext.Default.Resolving += static (loadContext, assemblyName) =>
+        {
+            if (string.IsNullOrWhiteSpace(assemblyName.Name))
+            {
+                return null;
+            }
+
+            var assemblyPath = Path.Combine(
+                AppContext.BaseDirectory,
+                "plugins",
+                assemblyName.Name + ".dll");
+            return File.Exists(assemblyPath)
+                ? loadContext.LoadFromAssemblyPath(assemblyPath)
+                : null;
+        };
+    }
+
+    private static int Run(string[] args)
+    {
+        if (Updater.TryApply(args, out var updateExitCode))
+        {
+            return updateExitCode;
+        }
+
+        args = NormalizeInternalArguments(args, out var isMitigatedChild);
+        if (!isMitigatedChild && Environment.GetEnvironmentVariable(YoungGenerationSizeEnvironment) is null)
+        {
+            Environment.SetEnvironmentVariable(YoungGenerationSizeEnvironment, YoungGenerationSize);
+        }
+
+        if (!isMitigatedChild && Environment.GetEnvironmentVariable(SurvivorGenerationBudgetEnvironment) is null)
+        {
+            Environment.SetEnvironmentVariable(SurvivorGenerationBudgetEnvironment, SurvivorGenerationBudget);
+        }
+
+        foreach (var (name, value) in ServerGarbageCollector)
+        {
+            if (!isMitigatedChild && Environment.GetEnvironmentVariable(name) is null)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+        }
+
+        if (args.Length == 0)
+        {
+            return GuiLauncher.Run();
+        }
+
+        // The executable uses the GUI subsystem, so CLI mode has to connect
+        // itself to a console before the first write.
+        if (!args.Contains(LaunchConfiguration.NoConsoleArgument, StringComparer.OrdinalIgnoreCase))
+        {
+            EnsureCliConsole();
+        }
+        UseUtf8ConsoleOutput();
+        if (isMitigatedChild && _preparedLaunch?.LogFile is { Length: > 0 } earlyLogFilePath)
+        {
+            TryEnableConsoleFileMirror(earlyLogFilePath);
+        }
+
+        if (args.Length > 0 && string.Equals(args[0], "--install-pkg", StringComparison.OrdinalIgnoreCase))
+        {
+            return InstallPkg(args);
+        }
+
+        if (!CheckHostArchitecture())
+        {
+            return 5;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            // Linux keeps SDL window work on the process main thread for
+            // consistent X11/Wayland event ownership. Emulation remains on a
+            // worker thread.
+            var exitCode = 0;
+            HostMainThread.Enable();
+            var emulation = new Thread(() =>
+            {
+                try
+                {
+                    exitCode = RunEmulator(args, isMitigatedChild);
+                }
+                finally
+                {
+                    HostMainThread.Shutdown();
+                }
+            }, 32 * 1024 * 1024)
+            {
+                Name = "SharpEmu Emulation",
+            };
+            emulation.Start();
+            HostMainThread.Pump();
+            emulation.Join();
+            return exitCode;
+        }
+
+        return RunEmulator(args, isMitigatedChild);
+    }
+
+    /// <summary>
+    /// The supported host execution model, checked before any emulation
+    /// starts: the CPU backend executes guest x86-64 code natively, so the
+    /// host process must be x86-64 (win-x64/linux-x64). Failing up front on
+    /// any other process architecture distinguishes that from Vulkan,
+    /// signal-handler, or guest-memory startup problems.
+    /// </summary>
+    private static bool CheckHostArchitecture()
+    {
+        if (RuntimeInformation.ProcessArchitecture == Architecture.X64)
+        {
+            return true;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] Unsupported process architecture " +
+            $"{RuntimeInformation.ProcessArchitecture}: guest code executes " +
+            "natively, so SharpEmu must run as an x86-64 process.");
+        return false;
+    }
+
+    private static int RunEmulator(string[] args, bool isMitigatedChild)
+    {
+        Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
+
+        var sessionArgument = args.SingleOrDefault(argument => argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal));
+        if (!isMitigatedChild && sessionArgument is null && TryRunGnmSupervisor(args, out var supervisedExitCode))
+            return supervisedExitCode;
+        if (!isMitigatedChild && TryRunMitigatedChild(args, out var childExitCode))
+        {
+            return childExitCode;
+        }
+
+        if (sessionArgument is not null)
+            args = args.Where(argument => !argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal)).ToArray();
+
+        if (!TryGetLaunchArguments(
+                args,
+                out var ebootPath,
+                out var runtimeOptions,
+                out var videoOptions,
+                out var logLevel,
+                out var logFilePath))
+        {
+            PrintUsage();
+            return 1;
+        }
+
+        if (!isMitigatedChild && !string.IsNullOrWhiteSpace(logFilePath))
+        {
+            TryEnableConsoleFileMirror(logFilePath);
+        }
+
+        SharpEmuLog.MinimumLevel = logLevel;
+        if (!HostVideoHost.TryConfigureVideo(videoOptions))
+        {
+            Console.Error.WriteLine("[LOADER][ERROR] Video options cannot change while a presenter is active.");
+            return 3;
+        }
+
+        GuiLauncher.ConfigureSplashFont();
+
+        Log.Info(BuildInfo.Banner);
+        Log.Info(HostSystemInfo.Summary);
+
+        ebootPath = Path.GetFullPath(ebootPath);
+        runtimeOptions = runtimeOptions with
+        {
+            ModsDirectory = new SharpEmu.Core.Mods.GameModRepository(
+                PerGameSettings.KeyFor(TryReadSettingsTitleId(ebootPath), ebootPath)).DirectoryPath,
+        };
+        Console.Error.WriteLine($"[DEBUG] Full path: {ebootPath}");
+
+        if (!File.Exists(ebootPath))
+        {
+            Log.Error($"EBOOT file was not found: {ebootPath}");
+            return 2;
+        }
+
+        if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
+        {
+            Log.Error($"Invalid --debug-server endpoint: {debugServerError}");
+            return 1;
+        }
+
+        SharpEmu.Debugger.DebuggerServerHost? debugHost = null;
+        if (debugServerEnabled)
+        {
+            debugHost = new SharpEmu.Debugger.DebuggerServerHost(debugServerOptions);
+            try
+            {
+                debugHost.Start();
+                Log.Info($"Live debug server listening on {debugHost.Endpoint}. Attach with SharpEmu.DebugClient.");
+                // With StopAtEntry, the guest parks at its first frame until a
+                // client connects and continues.
+                runtimeOptions = runtimeOptions with { DebugHook = debugHost.Hook };
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Failed to start the debug server.", ex);
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                return 6;
+            }
+        }
+
+        Console.Error.WriteLine("[DEBUG] Creating runtime...");
+
+        SharpEmu.Core.Diagnostics.WindowsCrashCapture.StartIfEnabled(logFilePath);
+
+        try
+        {
+            var gameLoader = GnmRuntime.CreateLoader(ebootPath);
+            using var loadExecSession = sessionArgument is null ? null :
+                GnmLoadExecSession.Open(sessionArgument[GnmLoadExecSession.ArgumentPrefix.Length..], ebootPath);
+            using var runtime = gameLoader is not null
+                ? GnmRuntime.CreateDefault(runtimeOptions with
+                {
+                    AdoptStartupAddressReservations = OperatingSystem.IsWindows() && isMitigatedChild,
+                }, gameLoader, loadExecSession)
+                : SharpEmuRuntime.CreateDefault(runtimeOptions with
+                {
+                    AdoptStartupAddressReservations = OperatingSystem.IsWindows() && isMitigatedChild,
+                });
+
+            OrbisGen2Result result;
+            ConsoleCancelEventHandler? cancelHandler = null;
+            try
+            {
+                cancelHandler = (_, eventArgs) =>
+                {
+                    eventArgs.Cancel = true;
+                    VideoOutExports.NotifyHostInterrupt();
+                };
+                Console.CancelKeyPress += cancelHandler;
+                // SIGTERM (launchd, process managers, `kill`) takes the same cooperative shutdown: the
+                // runtime's default exits with GPU work in flight, which leaves the host driver to reclaim
+                // resources the device still owns.
+                using var terminateRegistration = OperatingSystem.IsWindows()
+                    ? null
+                    : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+                    {
+                        context.Cancel = true;
+                        VideoOutExports.NotifyHostInterrupt();
+                    });
+
+                Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
+                result = runtime.Run(ebootPath);
+                Console.Error.WriteLine($"[DEBUG] Result: {result}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[DEBUG] Exception: {ex}");
+                Log.Error("SharpEmu failed to run.", ex);
+                return 3;
+            }
+            finally
+            {
+                if (cancelHandler is not null)
+                {
+                    Console.CancelKeyPress -= cancelHandler;
+                }
+            }
+
+            Log.Info($"SharpEmu execution completed. Result={result} (0x{(int)result:X8})");
+            if (!string.IsNullOrWhiteSpace(runtime.LastSessionSummary))
+            {
+                Log.Info(runtime.LastSessionSummary);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastBasicBlockTrace))
+            {
+                Log.Info("BB trace:");
+                Log.Info(runtime.LastBasicBlockTrace);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastMilestoneLog))
+            {
+                Log.Info(runtime.LastMilestoneLog);
+            }
+
+            if (result != OrbisGen2Result.ORBIS_GEN2_OK && !string.IsNullOrWhiteSpace(runtime.LastExecutionDiagnostics))
+            {
+                Log.Warn(runtime.LastExecutionDiagnostics);
+            }
+
+            if (runtimeOptions.ImportTraceLimit > 0 && !string.IsNullOrWhiteSpace(runtime.LastExecutionTrace))
+            {
+                Log.Info("Import trace:");
+                Log.Info(runtime.LastExecutionTrace);
+            }
+
+            return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+        }
+        finally
+        {
+            if (debugHost is not null)
+            {
+                debugHost.NotifyRunCompleted();
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+
+        }
+    }
+
+    private static void EnsureCliConsole()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        // Standard handles already provided (pipes or file redirection, e.g.
+        // when the GUI or a script launches us): use them as-is.
+        if (IsHandleValid(GetStdHandle(STD_OUTPUT_HANDLE)) && IsHandleValid(GetStdHandle(STD_ERROR_HANDLE)))
+        {
+            return;
+        }
+
+        // Prefer the console of the parent process (interactive terminal);
+        // create one only when started with arguments but no terminal at all
+        // (e.g. a shortcut), so usage and errors remain visible.
+        if (!AttachConsole(ATTACH_PARENT_PROCESS) && GetConsoleWindow() == 0)
+        {
+            _ = AllocConsole();
+        }
+
+        RebindStdHandleToConsole(STD_OUTPUT_HANDLE);
+        RebindStdHandleToConsole(STD_ERROR_HANDLE);
+    }
+
+    /// <summary>
+    /// Makes console writes UTF-8 so the GUI's pipe reader (and any modern
+    /// terminal) decodes non-ASCII text correctly. Without this, redirected
+    /// output falls back to the OS ANSI code page and characters like "—"
+    /// arrive mangled.
+    /// </summary>
+    private static void UseUtf8ConsoleOutput()
+    {
+        try
+        {
+            // Also recreates the redirected Console.Out/Error writers with
+            // the new encoding.
+            Console.OutputEncoding = Encoding.UTF8;
+            return;
+        }
+        catch (Exception)
+        {
+            // No attached console (GUI-subsystem child with piped output):
+            // wrap the raw handles instead.
+        }
+
+        if (Console.IsOutputRedirected)
+        {
+            Console.SetOut(new StreamWriter(
+                Console.OpenStandardOutput(),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+            {
+                AutoFlush = true,
+            });
+        }
+
+        if (Console.IsErrorRedirected)
+        {
+            Console.SetError(new StreamWriter(
+                Console.OpenStandardError(),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+            {
+                AutoFlush = true,
+            });
+        }
+    }
+
+    private static void RebindStdHandleToConsole(int stdHandle)
+    {
+        if (IsHandleValid(GetStdHandle(stdHandle)) || GetConsoleWindow() == 0)
+        {
+            return;
+        }
+
+        var conOut = CreateFileW(
+            "CONOUT$",
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            0,
+            OPEN_EXISTING,
+            0,
+            0);
+        if (IsHandleValid(conOut))
+        {
+            _ = SetStdHandle(stdHandle, conOut);
+        }
+    }
+
+    private static bool IsHandleValid(nint handle)
+    {
+        return handle != 0 && handle != -1;
+    }
+
+    private static string[] NormalizeInternalArguments(
+        string[] args,
+        out bool isMitigatedChild)
+    {
+        isMitigatedChild = false;
+        var trustedMitigatedChild = string.Equals(
+            Environment.GetEnvironmentVariable(MitigatedChildEnvironment),
+            "1",
+            StringComparison.Ordinal);
+        if (args.Length == 0)
+        {
+            return args;
+        }
+
+        var list = new List<string>(args.Length);
+        foreach (var arg in args)
+        {
+            if (string.Equals(arg, MitigatedChildFlag, StringComparison.Ordinal))
+            {
+                isMitigatedChild = trustedMitigatedChild;
+                continue;
+            }
+
+            list.Add(arg);
+        }
+
+        return list.ToArray();
+    }
+
+    private static bool TryRunMitigatedChild(string[] args, out int childExitCode)
+    {
+        childExitCode = 0;
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_MITIGATION_RELAUNCH"), "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var processPath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(processPath))
+        {
+            return false;
+        }
+
+        var commandLineArguments = Environment.GetCommandLineArgs();
+        var entryAssemblyPath = commandLineArguments.Length > 0 ? commandLineArguments[0] : null;
+        string[] childArguments =
+            Path.GetFileNameWithoutExtension(processPath).Equals("dotnet", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(entryAssemblyPath)
+                ? [entryAssemblyPath, MitigatedChildFlag, .. args]
+                : [MitigatedChildFlag, .. args];
+
+        var commandLine = BuildCommandLine(processPath, childArguments);
+        var startupInfoEx = new STARTUPINFOEX();
+        startupInfoEx.StartupInfo.cb = Marshal.SizeOf<STARTUPINFOEX>();
+        ConfigureInheritedStdHandles(ref startupInfoEx.StartupInfo);
+
+        nint attributeList = 0;
+        nint mitigationPolicies = 0;
+        var previousChildEnvironment = Environment.GetEnvironmentVariable(MitigatedChildEnvironment);
+        try
+        {
+            nuint attributeListSize = 0;
+            _ = InitializeProcThreadAttributeList(0, 1, 0, ref attributeListSize);
+            attributeList = Marshal.AllocHGlobal((nint)attributeListSize);
+            if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeListSize))
+            {
+                childExitCode = 5;
+                Console.Error.WriteLine($"[ERROR] Failed to initialize mitigation attributes: {Marshal.GetLastWin32Error()}");
+                return true;
+            }
+
+            startupInfoEx.lpAttributeList = attributeList;
+
+            mitigationPolicies = Marshal.AllocHGlobal(sizeof(ulong) * 2);
+            Marshal.WriteInt64(mitigationPolicies, unchecked((long)GuestProcessMitigationPolicy.Primary));
+            Marshal.WriteInt64(nint.Add(mitigationPolicies, sizeof(long)), unchecked((long)GuestProcessMitigationPolicy.Secondary));
+
+            if (!UpdateProcThreadAttribute(
+                attributeList,
+                0,
+                (nint)PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                mitigationPolicies,
+                (nuint)(sizeof(ulong) * 2),
+                0,
+                0))
+            {
+                childExitCode = 5;
+                Console.Error.WriteLine($"[ERROR] Failed to apply mitigation attributes: {Marshal.GetLastWin32Error()}");
+                return true;
+            }
+
+            var cmdLineBuilder = new StringBuilder(commandLine);
+            nint jobHandle = 0;
+            Environment.SetEnvironmentVariable(MitigatedChildEnvironment, "1");
+            var created = CreateProcessW(
+                null,
+                cmdLineBuilder,
+                0,
+                0,
+                true,
+                EXTENDED_STARTUPINFO_PRESENT | WindowsGuestAddressReservation.CreateSuspended,
+                0,
+                Environment.CurrentDirectory,
+                ref startupInfoEx,
+                out var processInfo);
+            Environment.SetEnvironmentVariable(MitigatedChildEnvironment, previousChildEnvironment);
+            if (!created)
+            {
+                childExitCode = 5;
+                Console.Error.WriteLine($"[ERROR] Failed to launch mitigated child process: {Marshal.GetLastWin32Error()}");
+                return true;
+            }
+
+            try
+            {
+                jobHandle = CreateJobObjectW(0, null);
+                if (jobHandle != 0 &&
+                    TryEnableKillOnJobClose(jobHandle) &&
+                    !AssignProcessToJobObject(jobHandle, processInfo.hProcess))
+                {
+                    CloseHandle(jobHandle);
+                    jobHandle = 0;
+                }
+
+                WindowsGuestAddressReservation.PrepareAndResume(processInfo.hProcess, processInfo.hThread);
+                ConsoleCancelEventHandler? cancelHandler = null;
+                EventHandler? processExitHandler = null;
+                cancelHandler = (_, eventArgs) =>
+                {
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                    eventArgs.Cancel = true;
+                };
+                processExitHandler = (_, _) =>
+                {
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                };
+                Console.CancelKeyPress += cancelHandler;
+                AppDomain.CurrentDomain.ProcessExit += processExitHandler;
+
+                _ = WaitForSingleObject(processInfo.hProcess, INFINITE);
+                Console.CancelKeyPress -= cancelHandler;
+                AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+
+                if (!GetExitCodeProcess(processInfo.hProcess, out var exitCode))
+                {
+                    return false;
+                }
+
+                childExitCode = unchecked((int)exitCode);
+                Console.Error.WriteLine("[DEBUG] Running in mitigated child process (CET/CFG disabled).");
+                return true;
+            }
+            catch (System.ComponentModel.Win32Exception exception)
+            {
+                childExitCode = 5;
+                Console.Error.WriteLine($"[ERROR] Guest process preparation failed: {exception.Message}");
+                return true;
+            }
+            finally
+            {
+                if (jobHandle != 0)
+                {
+                    CloseHandle(jobHandle);
+                }
+
+                CloseHandle(processInfo.hThread);
+                CloseHandle(processInfo.hProcess);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(MitigatedChildEnvironment, previousChildEnvironment);
+
+            if (attributeList != 0)
+            {
+                DeleteProcThreadAttributeList(attributeList);
+                Marshal.FreeHGlobal(attributeList);
+            }
+
+            if (mitigationPolicies != 0)
+            {
+                Marshal.FreeHGlobal(mitigationPolicies);
+            }
+        }
+    }
+
+    private static string BuildDefaultLogFilePath(string? ebootPath)
+    {
+        var key = string.IsNullOrWhiteSpace(ebootPath) ? "UNKNOWN"
+            : PerGameSettings.KeyFor(TryReadSettingsTitleId(ebootPath), ebootPath);
+        return LaunchConfiguration.ResolveLogFilePath(
+            GuiSettings.Load(), key, Path.Combine(SharpEmu.Libs.SharpEmuPaths.DataRoot, "user", "logs"));
+    }
+
+    // The title id that names a game's settings file, the way the launcher resolves it:
+    // param.json, else the compatibility-mode (GNM) executable's own metadata.
+    private static string? TryReadSettingsTitleId(string ebootPath)
+    {
+        var titleId = TryReadTitleId(ebootPath);
+        if (titleId is not null)
+        {
+            return titleId;
+        }
+
+        try
+        {
+            return GnmRuntime.ReadApplicationInfo(ebootPath).TitleId;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TryReadTitleId(string? ebootPath)
+    {
+        if (string.IsNullOrWhiteSpace(ebootPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var directory = ZArchive.IsArchivePath(ebootPath)
+                ? ZArchiveCache.ExtractMetadata(ebootPath)
+                : Path.GetDirectoryName(Path.GetFullPath(ebootPath));
+            if (string.IsNullOrEmpty(directory))
+            {
+                return null;
+            }
+
+            foreach (var paramPath in new[]
+            {
+                Path.Combine(directory, "sce_sys", "param.json"),
+                Path.Combine(directory, "param.json"),
+            })
+            {
+                if (!File.Exists(paramPath))
+                {
+                    continue;
+                }
+
+                using var document = JsonDocument.Parse(File.ReadAllText(paramPath));
+                if (document.RootElement.TryGetProperty("titleId", out var titleIdElement) &&
+                    titleIdElement.ValueKind == JsonValueKind.String)
+                {
+                    var titleId = titleIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(titleId))
+                    {
+                        return titleId.Trim();
+                    }
+                }
+            }
+
+            return GnmRuntime.ReadApplicationInfo(ebootPath).TitleId;
+        }
+        catch
+        {
+            // Logging should never block launch; unknown title ids use a stable fallback.
+        }
+
+        return null;
+    }
+
+    private static bool ShouldConsumeLogFilePath(IReadOnlyList<string> args, int candidateIndex)
+    {
+        var candidate = args[candidateIndex];
+        if (LooksLikeLogFilePath(candidate))
+        {
+            return true;
+        }
+
+        for (var i = candidateIndex + 1; i < args.Count; i++)
+        {
+            var argument = args[i];
+            if (!string.IsNullOrWhiteSpace(argument) &&
+                !argument.StartsWith("--", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeLogFilePath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return string.Equals(extension, ".log", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".txt", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void TryEnableConsoleFileMirror(string path)
+    {
+        lock (ConsoleMirrorSync)
+        {
+            if (_consoleMirrorFile is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                var sessionArgument = Environment.GetCommandLineArgs()
+                    .FirstOrDefault(argument => argument.StartsWith(GnmLoadExecSession.ArgumentPrefix, StringComparison.Ordinal));
+                var append = sessionArgument is not null &&
+                    GnmLoadExecSession.IsRestart(sessionArgument[GnmLoadExecSession.ArgumentPrefix.Length..]);
+                var stream = new FileStream(
+                    path,
+                    append ? FileMode.Append : FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.ReadWrite,
+                    bufferSize: 4096,
+                    FileOptions.SequentialScan);
+                _consoleMirrorFile = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+                {
+                    AutoFlush = true,
+                };
+
+                Console.SetOut(new TeeTextWriter(Console.Out, _consoleMirrorFile));
+                Console.SetError(new TeeTextWriter(Console.Error, _consoleMirrorFile));
+                Console.Error.WriteLine($"[DEBUG] Log file: {Path.GetFullPath(path)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] Could not open log file '{path}': {ex.Message}");
+            }
+        }
+    }
+
+    private static void DropConsoleFileMirror()
+    {
+        lock (ConsoleMirrorSync)
+        {
+            try
+            {
+                _consoleMirrorFile?.Flush();
+                _consoleMirrorFile?.Dispose();
+            }
+            catch
+            {
+            }
+
+            _consoleMirrorFile = null;
+        }
+    }
+
+    private static void ConfigureInheritedStdHandles(ref STARTUPINFO startupInfo)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var input = GetStdHandle(STD_INPUT_HANDLE);
+        var output = GetStdHandle(STD_OUTPUT_HANDLE);
+        var error = GetStdHandle(STD_ERROR_HANDLE);
+        if (!IsHandleValid(output) && !IsHandleValid(error))
+        {
+            return;
+        }
+
+        if (IsHandleValid(input))
+        {
+            _ = SetHandleInformation(input, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            startupInfo.hStdInput = input;
+        }
+
+        if (IsHandleValid(output))
+        {
+            _ = SetHandleInformation(output, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            startupInfo.hStdOutput = output;
+        }
+
+        if (IsHandleValid(error))
+        {
+            _ = SetHandleInformation(error, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            startupInfo.hStdError = error;
+        }
+
+        startupInfo.dwFlags |= STARTF_USESTDHANDLES;
+    }
+
+    private static string BuildCommandLine(string processPath, IReadOnlyList<string> args)
+    {
+        var builder = new StringBuilder();
+        builder.Append(QuoteArgument(processPath));
+        for (var i = 0; i < args.Count; i++)
+        {
+            builder.Append(' ');
+            builder.Append(QuoteArgument(args[i]));
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool TryEnableKillOnJobClose(nint jobHandle)
+    {
+        var extendedLimitInfo = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            BasicLimitInformation = new JOBOBJECT_BASIC_LIMIT_INFORMATION
+            {
+                LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+
+        var size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        var memory = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(extendedLimitInfo, memory, false);
+            return SetInformationJobObject(
+                jobHandle,
+                JobObjectExtendedLimitInformation,
+                memory,
+                unchecked((uint)size));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(memory);
+        }
+    }
+
+    private static string QuoteArgument(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "\"\"";
+        }
+
+        var needsQuotes = false;
+        foreach (var c in argument)
+        {
+            if (char.IsWhiteSpace(c) || c == '"')
+            {
+                needsQuotes = true;
+                break;
+            }
+        }
+
+        if (!needsQuotes)
+        {
+            return argument;
+        }
+
+        var builder = new StringBuilder(argument.Length + 2);
+        builder.Append('"');
+
+        var backslashCount = 0;
+        foreach (var c in argument)
+        {
+            if (c == '\\')
+            {
+                backslashCount++;
+                continue;
+            }
+
+            if (c == '"')
+            {
+                builder.Append('\\', (backslashCount * 2) + 1);
+                builder.Append('"');
+                backslashCount = 0;
+                continue;
+            }
+
+            if (backslashCount > 0)
+            {
+                builder.Append('\\', backslashCount);
+                backslashCount = 0;
+            }
+
+            builder.Append(c);
+        }
+
+        if (backslashCount > 0)
+        {
+            builder.Append('\\', backslashCount * 2);
+        }
+
+        builder.Append('"');
+        return builder.ToString();
+    }
+
+    // --install-pkg <file.pkg> [destination]: unpacks a fake PS4 or PS5 package into a game folder (by
+    // default <pkg folder>/<game title>) that can then be launched through its eboot.bin.
+    private static int InstallPkg(string[] args)
+    {
+        if (args.Length is < 2 or > 3)
+        {
+            Log.Error("Usage: SharpEmu.CLI --install-pkg <path-to-game.pkg> [destination-folder]");
+            return 2;
+        }
+
+        var pkgPath = Path.GetFullPath(args[1]);
+        if (!File.Exists(pkgPath))
+        {
+            Log.Error($"Package not found: {pkgPath}");
+            return 2;
+        }
+
+        try
+        {
+            using var package = SharpEmu.HLE.FileSystem.Pkg.GamePackage.Open(pkgPath);
+            if (!package.IsGameApplication)
+            {
+                Log.Error($"{Path.GetFileName(pkgPath)} is not a base game (category '{package.Category}'). Patches and DLC packages are not supported yet.");
+                return 2;
+            }
+
+            var destination = args.Length == 3
+                ? Path.GetFullPath(args[2])
+                : Path.Combine(
+                    Path.GetDirectoryName(pkgPath)!,
+                    package.GetFolderName(Path.GetFileNameWithoutExtension(pkgPath)));
+            Log.Info($"Installing {Path.GetFileName(pkgPath)} ({package.ContentId}) into {destination}");
+
+            var lastPercent = -1;
+            var progress = new SynchronousProgress<SharpEmu.HLE.FileSystem.Pkg.PkgExtractProgress>(report =>
+            {
+                var percent = report.BytesTotal == 0 ? 100 : (int)(report.BytesDone * 100 / report.BytesTotal);
+                if (percent != lastPercent)
+                {
+                    lastPercent = percent;
+                    Log.Info($"{percent,3}%  {report.BytesDone / (1024.0 * 1024 * 1024):0.00} / {report.BytesTotal / (1024.0 * 1024 * 1024):0.00} GB  {report.CurrentFile}");
+                }
+            });
+            package.Extract(destination, progress);
+            Log.Info($"Done. Launch it with: SharpEmu.CLI \"{Path.Combine(destination, "eboot.bin")}\"");
+            return 0;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            Log.Error($"Installing the package failed: {exception.Message}");
+            return 1;
+        }
+    }
+
+    private sealed class SynchronousProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
+    }
+
+    private static void PrintUsage()
+    {
+        Log.Info("Usage: SharpEmu.CLI [--strict[=on|off]] [--trace-imports[=N]] [--cpu-engine=<native>] [--console=<ps5>] [--console-language=<language>] [--log-level=<level>] [--log-file[=<path>]] [--no-log-file] [--window-mode=<windowed|borderless|exclusive>] [--resolution=<WIDTHxHEIGHT>] [--display=<N>] [--refresh-rate=<HZ>] [--scaling=<fit|cover|stretch|integer>] [--vsync=<on|off>] [--hdr=<auto|on|off>] [--overlay=<on|off>] [--overlay-mode=<full|minimal|titlebar>] [--overlay-corner=<topleft|topright|bottomright|bottomleft>] [--debug-server[=host:port]] <path-to-eboot.bin|path-to-game.zar>");
+        Log.Info("Install a fake PS4 or PS5 package: SharpEmu.CLI --install-pkg <path-to-game.pkg> [destination-folder]");
+        Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
+        Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
+    }
+
+    /// <summary>
+    /// Detects the <c>--debug-server</c> flag and parses its optional
+    /// <c>host:port</c> endpoint. Returns false only when the flag is present but
+    /// its endpoint is malformed, so the caller can abort with a clear error.
+    /// </summary>
+    private static bool TryGetDebugServerOptions(
+        string[] args,
+        out bool enabled,
+        out SharpEmu.Debugger.Server.DebuggerServerOptions options,
+        out string error)
+    {
+        enabled = false;
+        options = new SharpEmu.Debugger.Server.DebuggerServerOptions();
+        error = string.Empty;
+        foreach (var argument in args)
+        {
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                continue;
+            }
+
+            const string prefix = "--debug-server=";
+            if (argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                if (!SharpEmu.Debugger.Server.DebuggerServerOptions.TryParseEndpoint(argument[prefix.Length..], out options, out error))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryGetLaunchArguments(string[] args, out string path,
+        out SharpEmuRuntimeOptions runtime, out HostVideoOptions video, out LogLevel level, out string? logFile)
+    {
+        if (_preparedLaunch is not { } prepared)
+            return TryParseArguments(args, out path, out runtime, out video, out level, out logFile);
+        path = prepared.Path;
+        runtime = prepared.Runtime;
+        video = prepared.Video;
+        level = prepared.LogLevel;
+        logFile = prepared.LogFile;
+        return true;
+    }
+
+    private static bool TryParseArguments(
+        string[] args,
+        out string ebootPath,
+        out SharpEmuRuntimeOptions runtimeOptions,
+        out HostVideoOptions videoOptions,
+        out LogLevel logLevel,
+        out string? logFilePath)
+    {
+        if (args.Length == 0)
+        {
+            ebootPath = string.Empty;
+            runtimeOptions = default;
+            videoOptions = HostVideoOptions.Default;
+            logLevel = SharpEmuLog.MinimumLevel;
+            logFilePath = null;
+            return false;
+        }
+
+        bool? strictDynlibResolution = null;
+        var importTraceLimit = 0;
+        var cpuEngine = CpuExecutionEngine.NativeOnly;
+        var systemLanguage = 1;
+        HostWindowMode? windowModeOverride = null;
+        HostScalingMode? scalingModeOverride = null;
+        int? windowWidthOverride = null;
+        int? windowHeightOverride = null;
+        int? displayIndexOverride = null;
+        int? refreshRateOverride = null;
+        bool? vsyncOverride = null;
+        HostHdrMode? hdrModeOverride = null;
+        bool? overlayEnabledOverride = null;
+        PerformanceOverlayMode? overlayModeOverride = null;
+        PerformanceOverlayCorner? overlayCornerOverride = null;
+        videoOptions = HostVideoOptions.Default;
+        logFilePath = null;
+        logLevel = SharpEmuLog.MinimumLevel;
+        var pathTokens = new List<string>(args.Length);
+        for (var i = 0; i < args.Length; i++)
+        {
+            var argument = args[i];
+            if (argument.Equals(LaunchConfiguration.NoConsoleArgument, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (TrySplitOption(argument, "--console", out var consoleText))
+            {
+                if (!string.Equals(consoleText, "ps5", StringComparison.OrdinalIgnoreCase))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                continue;
+            }
+            if (TrySplitOption(argument, "--console-language", out var consoleLanguageText))
+            {
+                if (!TryParseSystemLanguage(consoleLanguageText, out systemLanguage))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                continue;
+            }
+            if (TrySplitOption(argument, "--window-mode", out var windowModeText))
+            {
+                if (!TryParseWindowMode(windowModeText, out var windowMode))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                windowModeOverride = windowMode;
+                continue;
+            }
+            if (TrySplitOption(argument, "--resolution", out var resolutionText))
+            {
+                if (!TryParseResolution(resolutionText, out var windowWidth, out var windowHeight))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                windowWidthOverride = windowWidth;
+                windowHeightOverride = windowHeight;
+                continue;
+            }
+            if (TrySplitOption(argument, "--display", out var displayText))
+            {
+                if (!int.TryParse(displayText, out var displayIndex) || displayIndex < 0)
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                displayIndexOverride = displayIndex;
+                continue;
+            }
+            if (TrySplitOption(argument, "--refresh-rate", out var refreshText))
+            {
+                if (!int.TryParse(refreshText, out var refreshRate) || refreshRate < 0)
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                refreshRateOverride = refreshRate;
+                continue;
+            }
+            if (TrySplitOption(argument, "--scaling", out var scalingText))
+            {
+                if (!TryParseScalingMode(scalingText, out var scalingMode))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                scalingModeOverride = scalingMode;
+                continue;
+            }
+            if (TrySplitOption(argument, "--vsync", out var vsyncText))
+            {
+                if (!TryParseSwitch(vsyncText, out var vsync))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                vsyncOverride = vsync;
+                continue;
+            }
+            if (TrySplitOption(argument, "--overlay", out var overlayText))
+            {
+                if (!TryParseSwitch(overlayText, out var overlayEnabled))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                overlayEnabledOverride = overlayEnabled;
+                continue;
+            }
+            if (TrySplitOption(argument, "--overlay-mode", out var overlayModeText))
+            {
+                if (!Enum.TryParse<PerformanceOverlayMode>(overlayModeText, true, out var overlayMode) ||
+                    !Enum.IsDefined(overlayMode))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                overlayModeOverride = overlayMode;
+                continue;
+            }
+            if (TrySplitOption(argument, "--overlay-corner", out var overlayCornerText))
+            {
+                if (!Enum.TryParse<PerformanceOverlayCorner>(overlayCornerText, true, out var overlayCorner) ||
+                    !Enum.IsDefined(overlayCorner))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                overlayCornerOverride = overlayCorner;
+                continue;
+            }
+            if (TrySplitOption(argument, "--hdr", out var hdrText))
+            {
+                if (!TryParseHdrMode(hdrText, out var hdrMode))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                hdrModeOverride = hdrMode;
+                continue;
+            }
+            if (TrySplitOption(argument, "--strict", out var strictText))
+            {
+                if (!TryParseSwitch(strictText, out var strict))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                strictDynlibResolution = strict;
+                continue;
+            }
+            if (string.Equals(argument, "--no-log-file", StringComparison.OrdinalIgnoreCase))
+            {
+                logFilePath = null;
+                continue;
+            }
+            if (string.Equals(argument, "--strict", StringComparison.OrdinalIgnoreCase))
+            {
+                strictDynlibResolution = true;
+                continue;
+            }
+
+            // The debug-server endpoint is parsed separately (see
+            // TryGetDebugServerOptions); accept the flag here so it is not
+            // rejected as an unknown option or mistaken for the eboot path.
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase) ||
+                argument.StartsWith("--debug-server=", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (string.Equals(argument, "--trace-imports", StringComparison.OrdinalIgnoreCase))
+            {
+                importTraceLimit = DefaultImportTraceLimit;
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out var explicitLimit))
+                {
+                    importTraceLimit = Math.Max(0, explicitLimit);
+                    i++;
+                }
+
+                continue;
+            }
+
+            if (string.Equals(argument, "--log-level", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length || !SharpEmuLog.TryParseLevel(args[i + 1], out logLevel))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logFilePath = null;
+                    return false;
+                }
+
+                i++;
+                continue;
+            }
+
+            if (string.Equals(argument, "--cpu-engine", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length || !TryParseCpuEngine(args[i + 1], out cpuEngine))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logFilePath = null;
+                    return false;
+                }
+
+                i++;
+                continue;
+            }
+
+            if (string.Equals(argument, "--log-file", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length &&
+                    !string.IsNullOrWhiteSpace(args[i + 1]) &&
+                    !args[i + 1].StartsWith("--", StringComparison.Ordinal) &&
+                    ShouldConsumeLogFilePath(args, i + 1))
+                {
+                    logFilePath = args[++i];
+                }
+                else
+                {
+                    logFilePath = string.Empty; // resolve the default after the executable path is known
+                }
+
+                continue;
+            }
+
+            const string logLevelPrefix = "--log-level=";
+            if (argument.StartsWith(logLevelPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var valueText = argument[logLevelPrefix.Length..];
+                if (!SharpEmuLog.TryParseLevel(valueText, out logLevel))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+
+                continue;
+            }
+
+            const string cpuEnginePrefix = "--cpu-engine=";
+            if (argument.StartsWith(cpuEnginePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var valueText = argument[cpuEnginePrefix.Length..];
+                if (!TryParseCpuEngine(valueText, out cpuEngine))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logLevel = SharpEmuLog.MinimumLevel;
+                    logFilePath = null;
+                    return false;
+                }
+
+                continue;
+            }
+
+            const string tracePrefix = "--trace-imports=";
+            if (argument.StartsWith(tracePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var valueText = argument[tracePrefix.Length..];
+                if (!int.TryParse(valueText, out importTraceLimit))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logLevel = SharpEmuLog.MinimumLevel;
+                    return false;
+                }
+
+                importTraceLimit = Math.Max(0, importTraceLimit);
+                continue;
+            }
+
+            const string logFilePrefix = "--log-file=";
+            if (argument.StartsWith(logFilePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                logFilePath = argument[logFilePrefix.Length..];
+                if (string.IsNullOrWhiteSpace(logFilePath))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logLevel = SharpEmuLog.MinimumLevel;
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (argument.StartsWith("--", StringComparison.Ordinal))
+            {
+                ebootPath = string.Empty;
+                runtimeOptions = default;
+                logLevel = SharpEmuLog.MinimumLevel;
+                logFilePath = null;
+                return false;
+            }
+
+            pathTokens.Add(argument);
+        }
+
+        if (pathTokens.Count == 0)
+        {
+            ebootPath = string.Empty;
+            runtimeOptions = default;
+            logLevel = SharpEmuLog.MinimumLevel;
+            logFilePath = null;
+            return false;
+        }
+
+        ebootPath = string.Join(' ', pathTokens);
+        LaunchConfiguration configured;
+        try
+        {
+            configured = LaunchConfiguration.Load(ebootPath, TryReadSettingsTitleId(ebootPath));
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            runtimeOptions = default;
+            logFilePath = null;
+            return false;
+        }
+        var launcher = GuiSettings.Load();
+        if (!HasOption(args, "--console-language") && TryParseSystemLanguage(launcher.ConsoleLanguage, out var configuredLanguage))
+        {
+            systemLanguage = configuredLanguage;
+        }
+        foreach (var (name, value) in configured.BuildCliEnvironment(launcher, Environment.GetEnvironmentVariable))
+        {
+            Environment.SetEnvironmentVariable(name, value);
+        }
+        if (!HasOption(args, "--log-level") && SharpEmuLog.TryParseLevel(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_LEVEL") ?? configured.Settings.LogLevel, out var configuredLogLevel))
+        {
+            logLevel = configuredLogLevel;
+        }
+        if (!HasOption(args, "--trace-imports")) importTraceLimit = Math.Max(0, configured.Settings.ImportTraceLimit);
+        if (!HasOption(args, "--log-file") && !HasOption(args, "--no-log-file") && configured.Settings.LogToFile)
+        {
+            logFilePath = BuildDefaultLogFilePath(ebootPath);
+        }
+        if (logFilePath == string.Empty) logFilePath = BuildDefaultLogFilePath(ebootPath);
+        runtimeOptions = new SharpEmuRuntimeOptions
+        {
+            CpuEngine = cpuEngine,
+            SystemLanguage = systemLanguage,
+            StrictDynlibResolution = strictDynlibResolution ?? configured.Settings.StrictDynlibResolution,
+            ImportTraceLimit = importTraceLimit,
+        };
+        var configuredVideoOptions = LoadConfiguredVideoOptions(configured.Settings);
+        videoOptions = (configuredVideoOptions with
+        {
+            WindowMode = windowModeOverride ?? configuredVideoOptions.WindowMode,
+            ScalingMode = scalingModeOverride ?? configuredVideoOptions.ScalingMode,
+            Width = windowWidthOverride ?? configuredVideoOptions.Width,
+            Height = windowHeightOverride ?? configuredVideoOptions.Height,
+            DisplayIndex = displayIndexOverride ?? configuredVideoOptions.DisplayIndex,
+            RefreshRate = refreshRateOverride ?? configuredVideoOptions.RefreshRate,
+            VSync = vsyncOverride ?? configuredVideoOptions.VSync,
+            HdrMode = hdrModeOverride ?? configuredVideoOptions.HdrMode,
+            OverlayEnabled = overlayEnabledOverride ?? configuredVideoOptions.OverlayEnabled,
+            OverlayMode = overlayModeOverride ?? configuredVideoOptions.OverlayMode,
+            OverlayCorner = overlayCornerOverride ?? configuredVideoOptions.OverlayCorner,
+        }).Normalize();
+        return true;
+    }
+
+    private static bool HasOption(IEnumerable<string> args, string option) =>
+        args.Any(argument => argument.Equals(option, StringComparison.OrdinalIgnoreCase) ||
+            argument.StartsWith(option + "=", StringComparison.OrdinalIgnoreCase));
+
+    private static HostVideoOptions LoadConfiguredVideoOptions(EffectiveLaunchSettings effective)
+    {
+        var defaults = HostVideoOptions.Default;
+        try
+        {
+            var windowMode = TryParseWindowMode(effective.WindowMode, out var parsedWindowMode)
+                ? parsedWindowMode
+                : defaults.WindowMode;
+            var scalingMode = TryParseScalingMode(effective.ScalingMode, out var parsedScalingMode)
+                ? parsedScalingMode
+                : defaults.ScalingMode;
+            var hasResolution = TryParseResolution(
+                effective.Resolution,
+                out var configuredWidth,
+                out var configuredHeight);
+            var hdrMode = TryParseHdrMode(effective.HdrMode, out var parsedHdrMode)
+                ? parsedHdrMode
+                : defaults.HdrMode;
+
+            return new HostVideoOptions
+            {
+                WindowMode = windowMode,
+                ScalingMode = scalingMode,
+                Width = hasResolution ? configuredWidth : defaults.Width,
+                Height = hasResolution ? configuredHeight : defaults.Height,
+                DisplayIndex = effective.DisplayIndex,
+                RefreshRate = effective.RefreshRate,
+                VSync = effective.VSync,
+                HdrMode = hdrMode,
+                OverlayEnabled = effective.OverlayEnabled,
+                OverlayCorner = Enum.TryParse<PerformanceOverlayCorner>(effective.OverlayCorner, true, out var corner)
+                    ? corner : defaults.OverlayCorner,
+                OverlayMode = Enum.TryParse<PerformanceOverlayMode>(effective.OverlayMode, true, out var mode)
+                    ? mode : defaults.OverlayMode,
+            }.Normalize();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] GUI video settings could not be loaded; using defaults: {exception.Message}");
+            return defaults;
+        }
+    }
+
+    private static bool TrySplitOption(string argument, string name, out string value)
+    {
+        var prefix = name + "=";
+        if (argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            value = argument[prefix.Length..];
+            return true;
+        }
+
+        value = string.Empty;
+        return false;
+    }
+
+    private static bool TryParseWindowMode(string value, out HostWindowMode mode)
+    {
+        mode = value.ToLowerInvariant() switch
+        {
+            "windowed" => HostWindowMode.Windowed,
+            "borderless" => HostWindowMode.Borderless,
+            "exclusive" or "fullscreen" => HostWindowMode.ExclusiveFullscreen,
+            _ => (HostWindowMode)(-1),
+        };
+        return Enum.IsDefined(mode);
+    }
+
+    private static bool TryParseSystemLanguage(string value, out int language)
+    {
+        language = value.ToLowerInvariant() switch
+        {
+            "japanese" => 0,
+            "englishus" => 1,
+            "french" => 2,
+            "spanishspain" => 3,
+            "german" => 4,
+            "italian" => 5,
+            "dutch" => 6,
+            "portugueseportugal" => 7,
+            "russian" => 8,
+            "korean" => 9,
+            "chinesetraditional" => 10,
+            "chinesesimplified" => 11,
+            "finnish" => 12,
+            "swedish" => 13,
+            "danish" => 14,
+            "norwegian" => 15,
+            "polish" => 16,
+            "portuguesebrazil" => 17,
+            "englishuk" => 18,
+            "turkish" => 19,
+            "spanishlatinamerica" => 20,
+            "arabic" => 21,
+            "frenchcanada" => 22,
+            "czech" => 23,
+            "hungarian" => 24,
+            "greek" => 25,
+            "romanian" => 26,
+            "thai" => 27,
+            "vietnamese" => 28,
+            "indonesian" => 29,
+            "ukrainian" => 30,
+            _ => -1,
+        };
+        return language >= 0;
+    }
+
+    private static bool TryParseScalingMode(string value, out HostScalingMode mode)
+    {
+        mode = value.ToLowerInvariant() switch
+        {
+            "fit" => HostScalingMode.Fit,
+            "cover" => HostScalingMode.Cover,
+            "stretch" => HostScalingMode.Stretch,
+            "integer" => HostScalingMode.Integer,
+            _ => (HostScalingMode)(-1),
+        };
+        return Enum.IsDefined(mode);
+    }
+
+    private static bool TryParseHdrMode(string value, out HostHdrMode mode)
+    {
+        mode = value.ToLowerInvariant() switch
+        {
+            "auto" => HostHdrMode.Auto,
+            "on" or "true" or "1" => HostHdrMode.On,
+            "off" or "false" or "0" => HostHdrMode.Off,
+            _ => (HostHdrMode)(-1),
+        };
+        return Enum.IsDefined(mode);
+    }
+
+    private static bool TryParseResolution(string value, out int width, out int height)
+    {
+        var parts = value.Split('x', 'X');
+        if (parts.Length == 2 && int.TryParse(parts[0], out width) && int.TryParse(parts[1], out height) &&
+            width >= 640 && height >= 360)
+        {
+            return true;
+        }
+
+        width = 0;
+        height = 0;
+        return false;
+    }
+
+    private static bool TryParseSwitch(string value, out bool enabled)
+    {
+        if (value is "1" || value.Equals("on", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("true", StringComparison.OrdinalIgnoreCase))
+        {
+            enabled = true;
+            return true;
+        }
+        if (value is "0" || value.Equals("off", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            enabled = false;
+            return true;
+        }
+
+        enabled = false;
+        return false;
+    }
+
+    private static bool TryParseCpuEngine(string valueText, out CpuExecutionEngine engine)
+    {
+        if (string.Equals(valueText, "native", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(valueText, "native-only", StringComparison.OrdinalIgnoreCase))
+        {
+            engine = CpuExecutionEngine.NativeOnly;
+            return true;
+        }
+
+        engine = CpuExecutionEngine.NativeOnly;
+        return false;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public nint lpReserved;
+        public nint lpDesktop;
+        public nint lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public nint lpReserved2;
+        public nint hStdInput;
+        public nint hStdOutput;
+        public nint hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX
+    {
+        public STARTUPINFO StartupInfo;
+        public nint lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public nint hProcess;
+        public nint hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public nuint MinimumWorkingSetSize;
+        public nuint MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public nint Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public nuint ProcessMemoryLimit;
+        public nuint JobMemoryLimit;
+        public nuint PeakProcessMemoryUsed;
+        public nuint PeakJobMemoryUsed;
+    }
+
+    private sealed class TeeTextWriter : TextWriter
+    {
+        private readonly TextWriter _primary;
+        private readonly TextWriter _mirror;
+
+        public TeeTextWriter(TextWriter primary, TextWriter mirror)
+        {
+            _primary = primary;
+            _mirror = mirror;
+        }
+
+        public override Encoding Encoding => _primary.Encoding;
+
+        public override void Write(char value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Write(value);
+                _mirror.Write(value);
+            }
+        }
+
+        public override void Write(string? value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Write(value);
+                _mirror.Write(value);
+            }
+        }
+
+        public override void WriteLine(string? value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.WriteLine(value);
+                _mirror.WriteLine(value);
+            }
+        }
+
+        public override void Flush()
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Flush();
+                _mirror.Flush();
+            }
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool InitializeProcThreadAttributeList(
+        nint lpAttributeList,
+        int dwAttributeCount,
+        int dwFlags,
+        ref nuint lpSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute(
+        nint lpAttributeList,
+        uint dwFlags,
+        nint attribute,
+        nint lpValue,
+        nuint cbSize,
+        nint lpPreviousValue,
+        nint lpReturnSize);
+
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(nint lpAttributeList);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateJobObjectW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern nint CreateJobObjectW(nint lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetInformationJobObject(
+        nint hJob,
+        int jobObjectInfoClass,
+        nint lpJobObjectInfo,
+        uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AssignProcessToJobObject(nint hJob, nint hProcess);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcessW(
+        string? applicationName,
+        StringBuilder commandLine,
+        nint processAttributes,
+        nint threadAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+        uint creationFlags,
+        nint environment,
+        string currentDirectory,
+        ref STARTUPINFOEX startupInfo,
+        out PROCESS_INFORMATION processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(nint handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeProcess(nint process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(nint process, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint handle);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetConsoleWindow();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachConsole(int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllocConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint GetStdHandle(int stdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetStdHandle(int stdHandle, nint handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetHandleInformation(nint handle, uint mask, uint flags);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern nint CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        nint securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        nint templateFile);
+}

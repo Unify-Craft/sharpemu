@@ -1,0 +1,90 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.HLE;
+using SharpEmu.Libs.SystemService;
+using System.Buffers.Binary;
+using Xunit;
+
+namespace SharpEmu.Libs.Tests.SystemService;
+
+public sealed class SystemServiceExportsTests
+{
+    private const ulong MemoryBase = 0x1_0000_0000;
+
+    public SystemServiceExportsTests()
+    {
+        SystemServiceExports.ResetForTests();
+    }
+
+    [Fact]
+    public void EmptyEventPollPreservesTheEntireEventRecord()
+    {
+        var memory = new FakeCpuMemory(MemoryBase, 0x2004);
+        var sentinel = Enumerable.Repeat((byte)0xA5, 0x2004).ToArray();
+        Assert.True(memory.TryWrite(MemoryBase, sentinel));
+        var context = new CpuContext(memory, Generation.Gen5) { [CpuRegister.Rdi] = MemoryBase };
+        for (var poll = 0; poll < 3; poll++)
+            Assert.Equal(unchecked((int)0x80A10004), SystemServiceExports.SystemServiceReceiveEvent(context));
+        var actual = new byte[sentinel.Length];
+        Assert.True(memory.TryRead(MemoryBase, actual));
+        Assert.Equal(sentinel, actual);
+        context[CpuRegister.Rdi] = 0;
+        Assert.Equal(unchecked((int)0x80A10003), SystemServiceExports.SystemServiceReceiveEvent(context));
+    }
+
+    [Fact]
+    public void GetNoticeScreenSkipFlagWritesOneByteAtMemoryBoundary()
+    {
+        var memory = new FakeCpuMemory(MemoryBase, 1);
+        var context = new CpuContext(memory, Generation.Gen5);
+        Assert.True(memory.TryWrite(MemoryBase, new byte[] { 0xA5 }));
+        context[CpuRegister.Rdi] = MemoryBase;
+
+        Assert.Equal(0, SystemServiceExports.SystemServiceGetNoticeScreenSkipFlag(context));
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+
+        Span<byte> flag = stackalloc byte[1];
+        Assert.True(memory.TryRead(MemoryBase, flag));
+        Assert.Equal(0, flag[0]);
+    }
+
+    [Fact]
+    public void SetNoticeScreenSkipFlagRoundTripsThroughGetter()
+    {
+        var memory = new FakeCpuMemory(MemoryBase, 2);
+        var context = new CpuContext(memory, Generation.Gen5)
+        {
+            [CpuRegister.Rdi] = 1,
+        };
+
+        Assert.Equal(0, SystemServiceExports.SystemServiceSetNoticeScreenSkipFlag(context));
+
+        context[CpuRegister.Rdi] = MemoryBase;
+        Assert.Equal(0, SystemServiceExports.SystemServiceGetNoticeScreenSkipFlag(context));
+
+        Span<byte> flag = stackalloc byte[1];
+        Assert.True(memory.TryRead(MemoryBase, flag));
+        Assert.Equal(1, flag[0]);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(400)]
+    public void ParamGetIntReturnsConfiguredSystemLanguage(int parameterId)
+    {
+        var memory = new FakeCpuMemory(MemoryBase, sizeof(int));
+        var context = new CpuContext(memory, Generation.Gen5)
+        {
+            [CpuRegister.Rdi] = unchecked((ulong)parameterId),
+            [CpuRegister.Rsi] = MemoryBase,
+        };
+        SystemServiceExports.ConfigureApplicationInfo(null, 19);
+
+        Assert.Equal(0, SystemServiceExports.SystemServiceParamGetInt(context));
+
+        Span<byte> value = stackalloc byte[sizeof(int)];
+        Assert.True(memory.TryRead(MemoryBase, value));
+        Assert.Equal(19, BinaryPrimitives.ReadInt32LittleEndian(value));
+    }
+}

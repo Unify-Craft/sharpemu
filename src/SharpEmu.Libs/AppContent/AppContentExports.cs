@@ -1,0 +1,270 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
+using System.Buffers.Binary;
+using System.Text;
+using System.Text.Json;
+
+namespace SharpEmu.Libs.AppContent;
+
+public static class AppContentExports
+{
+    private const ulong FallbackAvailableSpaceKb = 1024UL * 1024UL; // 1 GiB
+    private const int AppContentErrorParameter = unchecked((int)0x80D90002);
+    private const int AppContentErrorDrmNoEntitlement = unchecked((int)0x80D90007);
+    private const int MountPointSize = 16;
+    private const ulong BootParamAttrOffset = 4;
+    private const string Temp0MountPoint = "/temp0";
+    private const uint AppParamSkuFlag = 0;
+    private const int AppParamSkuFlagFull = 3;
+
+    [SysAbiExport(
+        Nid = "R9lA82OraNs",
+        ExportName = "sceAppContentInitialize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentInitialize(CpuContext ctx)
+    {
+        var initParamAddress = ctx[CpuRegister.Rdi];
+        var bootParamAddress = ctx[CpuRegister.Rsi];
+        if (initParamAddress == 0 || bootParamAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> attrBytes = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(attrBytes, 0);
+        if (!ctx.Memory.TryWrite(bootParamAddress + BootParamAttrOffset, attrBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "xnd8BJzAxmk",
+        ExportName = "sceAppContentGetAddcontInfoList",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentGetAddcontInfoList(CpuContext ctx)
+    {
+        var hitCountAddress = ctx[CpuRegister.Rcx];
+        if (hitCountAddress != 0)
+        {
+            Span<byte> hitCountBytes = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(hitCountBytes, 0);
+            if (!ctx.Memory.TryWrite(hitCountAddress, hitCountBytes))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "99b82IKXpH4",
+        ExportName = "sceAppContentAppParamGetInt",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentAppParamGetInt(CpuContext ctx)
+    {
+        var paramId = (uint)ctx[CpuRegister.Rdi];
+        var valueAddress = ctx[CpuRegister.Rsi];
+        if (valueAddress == 0)
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        int value;
+        if (paramId == AppParamSkuFlag)
+        {
+            value = AppParamSkuFlagFull;
+        }
+        else if (!TryReadUserDefinedParam(paramId, out value))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> valueBytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
+        if (!ctx.Memory.TryWrite(valueAddress, valueBytes))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAppContent($"app_param_get_int id={paramId} value={value}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "VANhIWcqYak",
+        ExportName = "sceAppContentAddcontMount",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontMount(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var mountPointAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || mountPointAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        Span<byte> emptyMountPoint = stackalloc byte[MountPointSize];
+        if (!ctx.Memory.TryWrite(mountPointAddress, emptyMountPoint))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(AppContentErrorDrmNoEntitlement);
+    }
+
+    [SysAbiExport(
+        Nid = "buYbeLOGWmA",
+        ExportName = "sceAppContentTemporaryDataMount2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataMount2(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rsi];
+        if (mountPointAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Directory.CreateDirectory(KernelMemoryCompatExports.ResolveTemp0Root());
+        var mountPointBytes = Encoding.ASCII.GetBytes($"{Temp0MountPoint}\0");
+        if (!ctx.Memory.TryWrite(mountPointAddress, mountPointBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "SaKib2Ug0yI",
+        ExportName = "sceAppContentTemporaryDataGetAvailableSpaceKb",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataGetAvailableSpaceKb(CpuContext ctx) =>
+        WriteAvailableSpaceKb(ctx, "temporary_data");
+
+    [SysAbiExport(
+        Nid = "Gl6w5i0JokY",
+        ExportName = "sceAppContentDownloadDataGetAvailableSpaceKb",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentDownloadDataGetAvailableSpaceKb(CpuContext ctx)
+        => WriteAvailableSpaceKb(ctx, "download_data");
+
+    private static int WriteAvailableSpaceKb(CpuContext ctx, string storageKind)
+    {
+        var availableSpaceAddress = ctx[CpuRegister.Rsi];
+        if (availableSpaceAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var availableSpaceKb = GetHostAvailableSpaceKb();
+        Span<byte> spaceBytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(spaceBytes, availableSpaceKb);
+        if (!ctx.Memory.TryWrite(availableSpaceAddress, spaceBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        TraceAppContent($"{storageKind}_available_space_kb value={availableSpaceKb}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static ulong GetHostAvailableSpaceKb()
+    {
+        try
+        {
+            var storageRoot = KernelMemoryCompatExports.ResolveTemp0Root();
+            Directory.CreateDirectory(storageRoot);
+            var volumeRoot = Path.GetPathRoot(Path.GetFullPath(storageRoot));
+            if (!string.IsNullOrWhiteSpace(volumeRoot))
+            {
+                var availableBytes = new DriveInfo(volumeRoot).AvailableFreeSpace;
+                if (availableBytes > 0)
+                {
+                    return checked((ulong)availableBytes / 1024UL);
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            TraceAppContent($"available_space_fallback error='{exception.Message}'");
+        }
+
+        return FallbackAvailableSpaceKb;
+    }
+
+    private static bool TryReadUserDefinedParam(uint paramId, out int value)
+    {
+        value = 0;
+        if (paramId is < 1 or > 4)
+        {
+            return false;
+        }
+
+        var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
+        if (string.IsNullOrWhiteSpace(app0Root))
+        {
+            return true;
+        }
+
+        var paramJsonPath = SharpEmu.HLE.FileSystem.GameFileOverlay.ResolveFile(Path.Combine(app0Root, "sce_sys", "param.json"));
+        if (!File.Exists(paramJsonPath))
+        {
+            return true;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(paramJsonPath);
+            using var document = JsonDocument.Parse(stream);
+            var propertyName = $"userDefinedParam{paramId}";
+            if (document.RootElement.TryGetProperty(propertyName, out var element) &&
+                element.TryGetInt32(out var parsedValue))
+            {
+                value = parsedValue;
+            }
+
+            return true;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+        catch (JsonException)
+        {
+            return true;
+        }
+    }
+
+    private static void TraceAppContent(string message)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_APP_CONTENT"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] app_content.{message}");
+    }
+
+}

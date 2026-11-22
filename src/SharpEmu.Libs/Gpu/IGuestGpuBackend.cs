@@ -1,0 +1,233 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.HLE;
+using SharpEmu.Libs.Gpu.GpuCommands;
+using SharpEmu.ShaderCompiler;
+
+namespace SharpEmu.Libs.Gpu;
+
+/// <summary>
+/// The guest-GPU backend seam: everything the AGC/VideoOut export layers need from a
+/// host renderer, expressed in guest-domain terms so Vulkan and DX12 backends
+/// can each translate to their native API. Two rules keep it that way: no host-API
+/// value (formats, blend enums, barrier or pass concepts) may cross this interface,
+/// and submission is coarse-grained — synchronization is a backend-internal concern.
+///
+/// Shader compilation also lives behind the seam: the backend owns its codegen and
+/// returns opaque <see cref="IGuestCompiledShader"/> handles that only it can submit.
+/// </summary>
+internal interface IGuestGpuBackend
+{
+    /// <summary>Human-readable name of this backend ("Vulkan").</summary>
+    string BackendName { get; }
+
+    bool LinkedShaderCallsSupported => false;
+
+    /// <summary>Starts the presenter (window + device) once; safe to call repeatedly.</summary>
+    void EnsureStarted(uint width, uint height);
+
+    // Compiles one permutation of a program over its resource plan and binding layout.
+    bool TryCompileProgram(ShaderCompileRequest request, out IGuestCompiledShader? shader, out string error);
+
+    // The shader of a translation the translation disk cache kept (TranslationDiskCache); null when the backend keeps none.
+    IGuestCompiledShader? CreateCachedShader(byte[] payload, uint? inputLocationMask) => null;
+
+    // The vertex stage a tessellated pipeline requires and the control stage that feeds the guest's hull factors to the tessellator.
+    (IGuestCompiledShader Vertex, IGuestCompiledShader Control) CompileTessellationBridge(
+        SharpEmu.ShaderCompiler.Resources.BindingLayout layout, Gen5TessellationDomain domain) =>
+        throw new NotSupportedException($"The {BackendName} backend does not support merged tessellation.");
+
+    /// <summary>Returns the backend's no-color-output fragment shader.</summary>
+    IGuestCompiledShader GetDepthOnlyFragmentShader();
+
+    void HideSplashScreen();
+
+    /// <summary>Presents one CPU-produced BGRA frame.</summary>
+    void Submit(byte[] bgraFrame, uint width, uint height);
+
+    /// <summary>Presents a recognized fixed-function guest draw (see GuestDrawKind).</summary>
+    void SubmitGuestDraw(GuestDrawKind drawKind, uint width, uint height);
+
+
+    // A video-out export flip: the presenter captures the buffer and marks the request presented.
+    bool TrySubmitGuestImage(
+        int videoOutHandle,
+        int displayBufferIndex,
+        ulong address,
+        uint width,
+        uint height,
+        uint pitchInPixel,
+        ulong flipRequestId);
+
+    // Enqueues a guest command stream; queue 0 is graphics, 0x20 to 0x57 are the compute owners.
+    void SubmitCommandStream(ICpuMemory memory, uint queue, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots);
+
+    // Marks the frame boundary; off the worker it first waits for the accepted submissions.
+    IdleOutcome SubmitDone(ICpuMemory memory);
+
+    void RunAfterPendingCommandStreams(Action work)
+    {
+        work();
+    }
+
+    /// <summary>Registers a display buffer with its guest texture format tag.</summary>
+    void RegisterKnownDisplayBuffer(ulong address, uint guestFormat);
+
+    /// <summary>Format/numberType are raw guest texture descriptor codes.</summary>
+    bool IsGpuGuestImageAvailable(ulong address, uint format, uint numberType);
+
+    /// <summary>Counts a guest shader translation for the perf overlay.</summary>
+    void CountShaderCompilation();
+
+    (long Draws, double DrawMs, long Pipelines, long ShaderCompilations) ReadAndResetPerfCounters();
+
+    /// <summary>Asks a running presenter to close its window.</summary>
+    void RequestClose();
+}
+
+// A backend that keeps CPU snapshots of guest images; the AGC layer feeds it pixels and
+// mirrored writes. A backend with a guest image store reads guest memory itself.
+internal interface IGuestImageSnapshotBackend
+{
+    bool TrySubmitGuestImageBlit(GuestRenderTarget source, GuestRenderTarget destination);
+    void SubmitTranslatedDraw(
+        IGuestCompiledShader pixelShader,
+        IReadOnlyList<GuestDrawTexture> textures,
+        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        uint width,
+        uint height,
+        uint attributeCount,
+        IGuestCompiledShader? vertexShader = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        GuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
+        GuestRenderState? renderState = null);
+
+    void SubmitDepthOnlyTranslatedDraw(
+        IGuestCompiledShader pixelShader,
+        IReadOnlyList<GuestDrawTexture> textures,
+        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        GuestDepthTarget depthTarget,
+        IGuestCompiledShader? vertexShader = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        GuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
+        GuestRenderState? renderState = null,
+        ulong shaderAddress = 0,
+        int baseVertex = 0,
+        IReadOnlyList<GuestStageBindings>? stageBindings = null);
+
+    void SubmitOffscreenTranslatedDraw(
+        IGuestCompiledShader pixelShader,
+        IReadOnlyList<GuestDrawTexture> textures,
+        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        IReadOnlyList<GuestRenderTarget> targets,
+        IGuestCompiledShader? vertexShader = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        GuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
+        GuestRenderState? renderState = null,
+        GuestDepthTarget? depthTarget = null,
+        ulong shaderAddress = 0,
+        int baseVertex = 0,
+        IReadOnlyList<GuestStageBindings>? stageBindings = null);
+
+    void SubmitStorageTranslatedDraw(
+        IGuestCompiledShader pixelShader,
+        IReadOnlyList<GuestDrawTexture> textures,
+        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        uint width,
+        uint height,
+        ulong shaderAddress = 0);
+
+    long SubmitComputeDispatch(
+        ulong shaderAddress,
+        IGuestCompiledShader computeShader,
+        IReadOnlyList<GuestDrawTexture> textures,
+        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        uint groupCountX,
+        uint groupCountY,
+        uint groupCountZ,
+        uint baseGroupX,
+        uint baseGroupY,
+        uint baseGroupZ,
+        uint localSizeX,
+        uint localSizeY,
+        uint localSizeZ,
+        bool isIndirect,
+        bool writesGlobalMemory,
+        uint threadCountX = uint.MaxValue,
+        uint threadCountY = uint.MaxValue,
+        uint threadCountZ = uint.MaxValue,
+        GuestStageBindings? stageBindings = null);
+    // Global data share transfers queue in stream order behind the draws before them.
+    long SubmitGlobalDataShareFill(ulong offset, ulong size, byte value);
+
+    long SubmitGlobalDataShareCopyFromGuest(ulong offset, byte[] bytes);
+
+    long SubmitGlobalDataShareCopyToGuest(ulong guestAddress, ulong offset, ulong size);
+
+    // Valid after a GPU synchronization: the words the queued transfers and shaders left.
+    void ReadGlobalDataShare(Span<uint> destination, uint wordOffset, uint wordCount);
+
+    // A record that completes after every earlier record and the GPU work they committed.
+    long SubmitGpuSynchronization(string debugName);
+
+    /// <summary>Whether the image exists on the backend or an already-queued upload
+    /// owns its initialization (a pending image may skip a duplicate upload but is
+    /// not yet a valid flip source).</summary>
+    bool IsGuestImageUploadKnown(ulong address, uint format, uint numberType);
+
+    /// <summary>True when the first draw into this address must seed the backend
+    /// image from guest memory (PS5 render targets alias guest memory, so
+    /// CPU-prefilled pixels are visible before the first draw).</summary>
+    bool GuestImageWantsInitialData(ulong address);
+
+    void ProvideGuestImageInitialData(ulong address, byte[] rgbaPixels);
+
+    void SubmitGuestImageFill(ulong address, uint fillValue);
+
+    /// <summary>
+    /// Uploads guest-authored pixels into a live guest image. <paramref name="rowOffset"/>
+    /// is the first image row the buffer covers, so a caller that knows only part
+    /// of the surface changed can send that band instead of the whole thing; the
+    /// untouched rows on the host already hold the same bytes.
+    /// </summary>
+    void SubmitGuestImageWrite(ulong address, byte[] pixels, uint rowOffset = 0);
+
+    /// <summary>
+    /// Whether a non-zero <c>rowOffset</c> is honoured. Backends that cannot
+    /// upload a sub-range must report false so callers keep sending the whole
+    /// surface: a dropped band would leave the host copy stale, which is worse
+    /// than an oversized upload.
+    /// </summary>
+    bool SupportsPartialImageWrite => false;
+
+    /// <summary>
+    /// Asks the presenter to refresh CPU-dirty guest images on its render/present
+    /// drain. Must not enqueue retained plane copies on the producer path.
+    /// </summary>
+    void RequestCpuWrittenGuestImageSync(ulong scopeAddress = 0, ulong scopeByteCount = ulong.MaxValue);
+
+    bool TryGetGuestImageExtent(ulong address, out uint width, out uint height, out ulong byteCount);
+
+    IReadOnlyList<(ulong Address, uint Width, uint Height, ulong ByteCount)> GetGuestImageExtents();
+
+    /// <summary>Whether the backend's texture cache already holds this content; lets
+    /// the AGC layer skip copying texels out of guest memory on every draw.</summary>
+    bool IsTextureContentCached(in TextureCacheLookupIdentity identity);
+
+    /// <summary>Guest memory handle for backend self-healing (cache misses re-read
+    /// texels directly instead of showing a fallback pattern).</summary>
+    void AttachGuestMemory(ICpuMemory memory);
+}
